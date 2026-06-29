@@ -51,6 +51,11 @@ class TransformerLayerConfig:
     elementwise_affine: bool = True
     qk_norm: bool = False
     predict_d: str = 'none'  # none, predict_d, predict_dsig
+    # Initial values for the per-layer depth-prediction head (predict_d /
+    # predict_dsig). Propagated to MultiheadAttention so LVSM's init_d/init_sig
+    # actually take effect (previously hardcoded to 0.0/3.0 in the MHA).
+    init_depth: float = 0.0
+    init_sigma: float = 3.0
 
 
 @dataclass
@@ -244,6 +249,8 @@ class TransformerEncoderLayer(Module):
             bias=cfg.bias,
             qk_norm=cfg.qk_norm,
             predict_d=cfg.predict_d,
+            init_depth=cfg.init_depth,
+            init_sigma=cfg.init_sigma,
         )
         # Implementation of Feedforward model
         self.linear1 = Linear(cfg.d_model, cfg.dim_feedforward, bias=cfg.bias)

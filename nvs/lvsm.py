@@ -144,6 +144,36 @@ class LVSMDecoderOnlyModel(nn.Module):
             )
         elif self.config.pos_enc == "none":
             self.attention = None
+        elif self.config.pos_enc == "flag_rope":
+            # FlagRoPE (Plücker ray + 3D point dual RoPE) as a RayRoPE-compatible
+            # sdpa_fn. Lazy import so RayRoPE stays usable without `tokenmap`.
+            # All heads are geometric (content=0) to align with RayRoPE
+            # d_pj+0_3d. Depth uncertainty comes from the per-layer predicted_d
+            # (predict_dsig); pose/K uncertainty is off (use_uncertainty_perturbation=False).
+            from tokenmap.models.scene.probabilistic_flag_rope.sdpa_adapter_multi_query import (
+                FlagRoPEMultiQuerySdpaAttention,
+            )
+            from tokenmap.models.scene.probabilistic_flag_rope.flag_config import (
+                FlagRoPEConfig,
+            )
+            nhead = config.encoder.layer.nhead
+            d_model = config.encoder.layer.d_model
+            n_geo = nhead  # content=0 → all heads ray/point
+            flag_cfg = FlagRoPEConfig.from_d_model_and_num_heads(
+                d_model=d_model,
+                num_heads=nhead,
+                num_content_heads=0,
+                num_ray_heads=(n_geo + 1) // 2,
+                num_point_heads=n_geo // 2,
+                use_uncertainty_perturbation=False,
+            )
+            self.attention = FlagRoPEMultiQuerySdpaAttention(
+                config=flag_cfg,
+                patches_x=config.img_shape[1] // config.patch_size,
+                patches_y=config.img_shape[0] // config.patch_size,
+                image_width=config.img_shape[1],
+                image_height=config.img_shape[0],
+            )
         else:
             self.attention = PropeDotProductAttention(
                 head_dim=config.encoder.layer.d_model // config.encoder.layer.nhead,
@@ -305,7 +335,8 @@ class LVSMDecoderOnlyModel(nn.Module):
 
         with time_block("precompute_enc", enabled=timing_enabled):
             if  "0_pj" in config.pos_enc or "0_3d" in config.pos_enc \
-                or config.pos_enc in ["global-0+inf", "global-0+d"]:
+                or config.pos_enc in ["global-0+inf", "global-0+d"] \
+                or config.pos_enc == "flag_rope":
 
                 if context_depths is not None:
                     depths_for_rope = repeat(context_depths, "b v1 h w 1 -> (b v2) v1 h w 1", v2=v2)
