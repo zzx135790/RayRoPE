@@ -91,6 +91,10 @@ class LVSMDecoderOnlyModelConfig:
     # num_point_heads=0 yields a pure ray-head ablation (point head removed).
     num_ray_heads: Optional[int] = None
     num_point_heads: Optional[int] = None
+    # flag_rope scene-scale calibration override (no effect for RayRoPE). When not
+    # None, force a constant s=value per batch (overrides scene_scale_source),
+    # so flag_rope can be calibrated on datasets without GT depth (official re10k).
+    scene_scale_value: Optional[float] = None
     # Timing configuration
     timing_enabled: bool = False
 
@@ -183,6 +187,7 @@ class LVSMDecoderOnlyModel(nn.Module):
                 use_uncertainty_perturbation=False,
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,
+                scene_scale_value=self.config.scene_scale_value,
             )
             self.attention = FlagRoPEMultiQuerySdpaAttention(
                 config=flag_cfg,
