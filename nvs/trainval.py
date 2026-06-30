@@ -199,7 +199,13 @@ class LVSMLauncher(Launcher):
     def train_initialize(self) -> Dict[str, Any]:
         # ------------- Setup Data. ------------- #       
         if self.config.dataset == "re10k":
-            scenes = sorted(glob.glob(f"{RE10K_TRAIN_DIR}/*"))
+            # glob(*) would also pick up non-scene files (e.g. full_list.txt in
+            # our re10k layout); keep only scene sub-directories that hold a
+            # transforms.json. Data-layout adaptation only — no logic change.
+            scenes = sorted(
+                d for d in glob.glob(f"{RE10K_TRAIN_DIR}/*")
+                if os.path.isdir(d) and os.path.exists(os.path.join(d, "transforms.json"))
+            )
             dataset = RE10K_TrainDataset(
                 scenes,
                 patch_size=self.config.dataset_patch_size,
