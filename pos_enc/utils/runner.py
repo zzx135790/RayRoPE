@@ -81,6 +81,17 @@ class LauncherConfig:
     visual_subdir: str = "visuals"
     test_subdir: str = "tests"
 
+    # Optional wandb logging (default off = official behaviour). When enabled,
+    # self.writer is wrapped so existing add_scalar call sites mirror to wandb
+    # alongside the local TensorBoard log. No effect on training/test logic.
+    wandb_enabled: bool = False
+    wandb_mode: str = "online"  # "online" | "offline" | "disabled"
+    wandb_project: str = "tokenmap-flag-rope"
+    wandb_entity: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_name: Optional[str] = None
+    wandb_tags: str = ""  # comma-separated
+
 
 class Launcher:
     def __init__(self, config: LauncherConfig) -> None:
@@ -110,6 +121,39 @@ class Launcher:
 
         if self.world_rank == 0:
             self.writer = SummaryWriter(log_dir=f"{self.config.output_dir}/tb")
+            self._wandb_logger = None
+            if self.config.wandb_enabled:
+                # Mirror add_scalar/add_histogram to wandb via a SummaryWriter-
+                # compatible adapter (tokenmap.experiments.flag_rope.wandb_logging).
+                # Failure is non-fatal: falls back to a no-op logger (TB only).
+                try:
+                    from tokenmap.experiments.flag_rope.wandb_logging import (
+                        WandbWriter,
+                        init_logger,
+                    )
+                    from dataclasses import asdict
+                    cfg_dict = asdict(config)
+                    # Avoid dumping huge/nested model_config verbatim if present.
+                    cfg_dict = {k: v for k, v in cfg_dict.items()
+                                if k != "model_config"}
+                    logger = init_logger(
+                        enabled=True,
+                        mode=self.config.wandb_mode,
+                        project=self.config.wandb_project,
+                        entity=self.config.wandb_entity,
+                        name=self.config.wandb_name,
+                        group=self.config.wandb_group,
+                        tags=self.config.wandb_tags,
+                        config=cfg_dict,
+                    )
+                    if logger.enabled:
+                        self.writer = WandbWriter(logger, tb_writer=self.writer)
+                        self._wandb_logger = logger
+                        print(f"[wandb] run '{self.config.wandb_name}' "
+                              f"group='{self.config.wandb_group}' "
+                              f"mode={self.config.wandb_mode}")
+                except Exception as error:  # noqa: BLE001 - never break training
+                    print(f"[wandb] init failed ({error}); TB-only logging.")
             if not self.config.test_only:
                 (Path(self.output_dir) / "config.yaml").write_text(yaml.dump(config))
                 print(f"Wrote config to {self.output_dir}/config.yaml")
@@ -418,6 +462,8 @@ class Launcher:
                 _ = self.test_iteration(step, test_state)
 
         # Exit.
+        if self.world_rank == 0 and getattr(self, "_wandb_logger", None) is not None:
+            self._wandb_logger.finish()
         torch.distributed.destroy_process_group()
 
     def test(self):
@@ -451,6 +497,8 @@ class Launcher:
         _ = self.test_iteration(init_step, state)
 
         # Exit.
+        if self.world_rank == 0 and getattr(self, "_wandb_logger", None) is not None:
+            self._wandb_logger.finish()
         torch.distributed.destroy_process_group()
 
     def print_on_master(self, msg: str) -> None:

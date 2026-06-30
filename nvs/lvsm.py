@@ -95,6 +95,13 @@ class LVSMDecoderOnlyModelConfig:
     # None, force a constant s=value per batch (overrides scene_scale_source),
     # so flag_rope can be calibrated on datasets without GT depth (official re10k).
     scene_scale_value: Optional[float] = None
+    # flag_rope frequency-bank range override (no effect for RayRoPE). Log-spaced
+    # λ∈[min,max], ρ=2π/λ. Default [0.1,12] is designed for O(1) coords with a
+    # WIDE dynamic range (DTU ~300). On re10k O(1) with NARROW range (~1) the
+    # coarsest block (λ_max) under-aliases dead; narrowing/shifting the band lets
+    # us re-fit the bank to the dataset's coord spread.
+    freq_min_lambda: float = 0.1
+    freq_max_lambda: float = 12.0
     # Timing configuration
     timing_enabled: bool = False
 
@@ -188,6 +195,8 @@ class LVSMDecoderOnlyModel(nn.Module):
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,
                 scene_scale_value=self.config.scene_scale_value,
+                frequency_min_lambda=self.config.freq_min_lambda,
+                frequency_max_lambda=self.config.freq_max_lambda,
             )
             self.attention = FlagRoPEMultiQuerySdpaAttention(
                 config=flag_cfg,
