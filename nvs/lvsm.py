@@ -79,6 +79,12 @@ class LVSMDecoderOnlyModelConfig:
     
     denc_type: str = "d"  # "d" or "inv_d" or "asinh_d"
     depth_input: bool = False # concat context depth map to ref input
+
+    # flag_rope scene-scale normalisation ablation knobs (no effect for RayRoPE).
+    # scene_scale_source: "context"=median of real ref depths (fixed), "ones"=1.0 (bug repro).
+    # normalize_transform: True=fixed (t_q/s, no double /s on moment), False=bug repro.
+    scene_scale_source: str = "context"
+    normalize_transform: bool = True
     
     # Timing configuration
     timing_enabled: bool = False
@@ -166,6 +172,8 @@ class LVSMDecoderOnlyModel(nn.Module):
                 num_ray_heads=(n_geo + 1) // 2,
                 num_point_heads=n_geo // 2,
                 use_uncertainty_perturbation=False,
+                scene_scale_source=self.config.scene_scale_source,
+                normalize_transform=self.config.normalize_transform,
             )
             self.attention = FlagRoPEMultiQuerySdpaAttention(
                 config=flag_cfg,
