@@ -85,7 +85,12 @@ class LVSMDecoderOnlyModelConfig:
     # normalize_transform: True=fixed (t_q/s, no double /s on moment), False=bug repro.
     scene_scale_source: str = "context"
     normalize_transform: bool = True
-    
+
+    # flag_rope head allocation override (no effect for RayRoPE). When None, the
+    # default split is content=0, ray=ceil(nhead/2), point=floor(nhead/2). Setting
+    # num_point_heads=0 yields a pure ray-head ablation (point head removed).
+    num_ray_heads: Optional[int] = None
+    num_point_heads: Optional[int] = None
     # Timing configuration
     timing_enabled: bool = False
 
@@ -165,12 +170,16 @@ class LVSMDecoderOnlyModel(nn.Module):
             nhead = config.encoder.layer.nhead
             d_model = config.encoder.layer.d_model
             n_geo = nhead  # content=0 → all heads ray/point
+            # Default split: ray=ceil, point=floor. Allow override for ablation
+            # (e.g. num_point_heads=0 → pure ray-head encoder).
+            num_ray = config.num_ray_heads if config.num_ray_heads is not None else (n_geo + 1) // 2
+            num_point = config.num_point_heads if config.num_point_heads is not None else n_geo // 2
             flag_cfg = FlagRoPEConfig.from_d_model_and_num_heads(
                 d_model=d_model,
                 num_heads=nhead,
                 num_content_heads=0,
-                num_ray_heads=(n_geo + 1) // 2,
-                num_point_heads=n_geo // 2,
+                num_ray_heads=num_ray,
+                num_point_heads=num_point,
                 use_uncertainty_perturbation=False,
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,
