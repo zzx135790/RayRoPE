@@ -504,6 +504,26 @@ class LVSMLauncher(Launcher):
                 self.logging_on_master(f"NaN detected in model output at step {step}")
                 self.logging_on_master(f"Max focal length: {max_focal:.3f}")
                 self.logging_on_master(f"Max translation norm: {max_T:.3f}")
+                # Pose-noise NaN diagnostics: dump flag_rope attention cache +
+                # predicted_d ranges so we can locate the explosion.
+                att = getattr(model, "attention", None)
+                if att is not None and getattr(att, "_cache", None):
+                    for k in ["ray_phase", "phase_offset", "depth_axis", "scene_scale"]:
+                        t = att._cache.get(k)
+                        if t is None:
+                            continue
+                        fin = torch.isfinite(t).all().item()
+                        self.logging_on_master(
+                            f"  cache[{k}]: finite={fin} "
+                            f"absmax={t.abs().max().item():.3e} "
+                            f"shape={tuple(t.shape)}")
+                # predicted_d (depth head) — store on attention by RayRoPE/flag_rope
+                for attr in ("predicted_depth_maps", "last_predicted_d"):
+                    pd = getattr(att, attr, None) if att is not None else None
+                    if pd is not None and isinstance(pd, torch.Tensor):
+                        self.logging_on_master(
+                            f"  {attr}: finite={torch.isfinite(pd).all().item()} "
+                            f"absmax={pd.abs().max().item():.3e}")
 
             if self.config.perceptual_loss_w > 0:
                 perceptual_loss = perceptual(
