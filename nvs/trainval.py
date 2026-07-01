@@ -24,6 +24,12 @@ from nvs.lvsm import (
     LVSMDecoderOnlyModel,
     LVSMDecoderOnlyModelConfig,
 )
+from tokenmap.experiments.flag_rope.pose_noise import (
+    apply_pose_noise_to_c2w,
+    build_pose_sigma_overrides,
+    pad_to_full_camera_sigma,
+    sample_corrupt_subset,
+)
 from nvs.perceptual import Perceptual
 from pos_enc.utils.functional import random_SO3
 from pos_enc.utils.runner import Launcher, LauncherConfig, nested_to_device
@@ -78,6 +84,7 @@ class LVSMLauncherConfig(LauncherConfig):
     dataset: str = "re10k"  # "re10k" or "objaverse" or "co3d"
     dataset_patch_size: int = 256
     dataset_supervise_views: int = 6
+    dataset_input_views: int = 2  # ref (context) views; 4 for pose-robustness experiment
     dataset_batch_scenes: int = 4
     train_zoom_factor: float = 1.0
     train_random_zoom: bool = False
@@ -134,6 +141,22 @@ class LVSMLauncherConfig(LauncherConfig):
 
     # test index file
     test_index_fp: Optional[str] = None
+
+    # ── Pose-noise robustness experiment (flag_rope mode C vs blind vs RayRoPE) ──
+    # When pose_noise_enabled, a random subset of ref cameras is corrupted with
+    # rot+trans pose noise each train step (σ drawn in [lo,hi]); at test, a sweep
+    # of fixed levels (clean → strong) is evaluated. flag_rope (use_pose_uncertainty)
+    # is told the σ; RayRoPE / flag_rope-blind are not. See plan
+    # robust-strolling-treehouse.md.
+    pose_noise_enabled: bool = False
+    pose_noise_rot_train_lo: float = 0.0
+    pose_noise_rot_train_hi: float = 0.05
+    pose_noise_trans_train_lo: float = 0.0
+    pose_noise_trans_train_hi: float = 0.05
+    pose_noise_max_corrupt: int = 2  # train: k ~ Uniform{0..max_corrupt} of ref corrupted
+    pose_noise_test_levels: str = "0,0.01,0.02,0.05,0.1"  # rot level list (=trans level)
+    pose_noise_test_corrupt: int = 2  # test: fixed N of ref corrupted
+    pose_noise_seed: int = 1234
 
 
 class LVSMLauncher(Launcher):
@@ -196,6 +219,68 @@ class LVSMLauncher(Launcher):
         }
         return processed
 
+    def _num_patches(self) -> int:
+        cfg = self.config.model_config
+        px = cfg.img_shape[1] // cfg.patch_size
+        py = cfg.img_shape[0] // cfg.patch_size
+        return px * py
+
+    def _apply_pose_noise(
+        self,
+        ref_cams: Camera,
+        tar_cams: Camera,
+        per_cam_rot: torch.Tensor,
+        per_cam_trans: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[Camera, Optional[dict]]:
+        """Corrupt ref_cams poses by per-camera σ; return (new_ref_cams, sigma_overrides).
+
+        sigma_overrides is built (per-camera σ → per-token, target cameras 0, K/depth
+        0) and returned so flag_rope mode C can encode the uncertainty. It is the
+        caller's responsibility to pass it to model.forward only when the model is
+        pose-aware (use_pose_uncertainty); blind / RayRoPE pass None.
+        """
+        c2w_noisy = apply_pose_noise_to_c2w(
+            ref_cams.camtoworld, per_cam_rot, per_cam_trans, generator=generator,
+        )
+        new_ref_cams = Camera(
+            K=ref_cams.K, camtoworld=c2w_noisy,
+            width=ref_cams.width, height=ref_cams.height,
+        )
+        V1 = ref_cams.camtoworld.shape[1]
+        V2 = tar_cams.camtoworld.shape[1]
+        C = V1 + V2
+        rot_full, trans_full = pad_to_full_camera_sigma(per_cam_rot, per_cam_trans, C)
+        sigma_overrides = build_pose_sigma_overrides(rot_full, trans_full, self._num_patches())
+        return new_ref_cams, sigma_overrides
+
+    def _dist_avg(self, data: List[float], name: str, label: str = "") -> Tuple[float, int]:
+        """All-gather a per-scene metric across ranks → (mean, n). Inf/NaN dropped."""
+        collected_sizes = [None] * self.world_size
+        torch.distributed.all_gather_object(collected_sizes, len(data))
+        collected = [torch.empty(size, device=self.device) for size in collected_sizes]
+        torch.distributed.all_gather(collected, torch.tensor(data, device=self.device))
+        collected = torch.cat(collected)
+        if torch.isinf(collected).any():
+            self.logging_on_master(f"Inf in {label} {name}: {int(torch.isinf(collected).sum())}")
+            collected = collected[~torch.isinf(collected)]
+        if torch.isnan(collected).any():
+            self.logging_on_master(f"NaN in {label} {name}: {int(torch.isnan(collected).sum())}")
+            collected = collected[~torch.isnan(collected)]
+        return collected.mean().item(), len(collected)
+
+    def _pose_test_levels(self) -> list:
+        """Parse pose_noise_test_levels → list of (rot_std, trans_std, tag)."""
+        out = []
+        for s in self.config.pose_noise_test_levels.split(","):
+            s = s.strip()
+            if not s:
+                continue
+            v = float(s)
+            tag = "clean" if v == 0.0 else f"rot{v}"
+            out.append((v, v, tag))  # rot_std = trans_std = level
+        return out
+
     def train_initialize(self) -> Dict[str, Any]:
         # ------------- Setup Data. ------------- #       
         if self.config.dataset == "re10k":
@@ -211,6 +296,7 @@ class LVSMLauncher(Launcher):
                 patch_size=self.config.dataset_patch_size,
                 zoom_factor=self.config.train_zoom_factor,
                 random_zoom=self.config.train_random_zoom,
+                input_views=self.config.dataset_input_views,
                 supervise_views=self.config.dataset_supervise_views,
             )
         elif self.config.dataset == "objaverse":
@@ -343,16 +429,42 @@ class LVSMLauncher(Launcher):
         # print("camtoworld shape: ", ref_cams.camtoworld.shape, tar_cams.camtoworld.shape)
         # print("K shape: ", ref_cams.K.shape, tar_cams.K.shape)
 
+        # Pose-noise injection (train): corrupt a random k~Uniform{0..max_corrupt}
+        # subset of ref cameras with rot+trans σ drawn in [lo,hi]. The same σ is
+        # told to flag_rope (pose-aware) via pose_sigma_overrides; blind/RayRoPE
+        # get None (process corrupted input blind).
+        pose_sigma_overrides = None
+        if self.config.pose_noise_enabled:
+            V1 = ref_cams.camtoworld.shape[1]
+            B = ref_cams.camtoworld.shape[0]
+            gen = torch.Generator(device=self.device).manual_seed(
+                self.config.pose_noise_seed + step)
+            mask = sample_corrupt_subset(
+                V1, self.config.pose_noise_max_corrupt,
+                batch_size=B, device=self.device, generator=gen)
+            u = torch.rand(B, device=self.device, generator=gen)
+            rot_std = self.config.pose_noise_rot_train_lo + (
+                self.config.pose_noise_rot_train_hi - self.config.pose_noise_rot_train_lo) * u
+            trans_std = self.config.pose_noise_trans_train_lo + (
+                self.config.pose_noise_trans_train_hi - self.config.pose_noise_trans_train_lo) * u
+            per_cam_rot = torch.where(mask, rot_std[:, None], torch.zeros_like(rot_std[:, None]))
+            per_cam_trans = torch.where(mask, trans_std[:, None], torch.zeros_like(trans_std[:, None]))
+            ref_cams, pose_sigma_overrides = self._apply_pose_noise(
+                ref_cams, tar_cams, per_cam_rot, per_cam_trans)
+            if not self.config.model_config.use_pose_uncertainty:
+                pose_sigma_overrides = None  # blind / RayRoPE: don't tell the model
+
         # Enable timing only for rank 0 to avoid overhead
         timing_enabled = (self.world_rank == 0)
         timing_enabled = False
-        
+
         # Forward.
         with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
             with time_block("forward", timing_enabled):
-                outputs = model(ref_imgs, ref_cams, tar_cams, 
+                outputs = model(ref_imgs, ref_cams, tar_cams,
                         context_depths=context_depths,
-                        timing_enabled=timing_enabled)
+                        timing_enabled=timing_enabled,
+                        pose_sigma_overrides=pose_sigma_overrides)
                 outputs = torch.sigmoid(outputs)
 
                 if self.config.get_mask:
@@ -484,9 +596,12 @@ class LVSMLauncher(Launcher):
         if self.config.dataset == "re10k":
             if not self.config.render_video and self.config.test_index_fp is None:
                 assert (
-                    self.config.test_input_views == 2
-                    and self.config.test_supervise_views == 3
-                ), "Invalid input views and supervise views for RE10K, should be 2 and 3 respectively."
+                    (self.config.test_input_views == 2
+                     and self.config.test_supervise_views == 3)
+                    or (self.config.test_input_views == 4
+                        and self.config.test_supervise_views == 3)
+                ), ("Invalid input views and supervise views for RE10K, "
+                    "supported: (2,3) or (4,3).")
             
             for zoom_factor in self.config.test_zoom_factor:
                 dataset = RE10K_EvalDataset(
@@ -651,7 +766,75 @@ class LVSMLauncher(Launcher):
         return state
 
     @torch.inference_mode()
+    def pose_noise_test_sweep(self, step: int, state: Dict[str, Any]) -> None:
+        """Eval the trained ckpt over a sweep of pose-noise levels (clean → strong).
+
+        For each level, a FIXED first-N-of-ref subset is corrupted (deterministic,
+        seeded per level+scene for reproducibility); flag_rope (pose-aware) is told
+        the σ, blind/RayRoPE are not. Writes ``metrics_{tag}.json`` per level and
+        logs ``test/{psnr,ssim,lpips}_{tag}`` to wandb/TB.
+        """
+        dataloaders = state["dataloaders"]
+        model = state["model"]
+        model.eval()
+        levels = self._pose_test_levels()
+        for rot_std, trans_std, tag in levels:
+            for label, (input_views, dataloader) in dataloaders.items():
+                psnrs, ssims, lpips = [], [], []
+                for idx, data in enumerate(dataloader):
+                    processed = self.preprocess(data, input_views=input_views)
+                    ref_imgs, tar_imgs = processed["ref_imgs"], processed["tar_imgs"]
+                    ref_cams, tar_cams = processed["ref_cams"], processed["tar_cams"]
+                    context_depths = processed.get("context_depths", None)
+                    pose_sigma_overrides = None
+                    if rot_std > 0.0:
+                        V1 = ref_cams.camtoworld.shape[1]
+                        B = ref_cams.camtoworld.shape[0]
+                        dtype = ref_cams.camtoworld.dtype
+                        per_cam_rot = torch.zeros(B, V1, device=self.device, dtype=dtype)
+                        per_cam_trans = torch.zeros(B, V1, device=self.device, dtype=dtype)
+                        n = min(self.config.pose_noise_test_corrupt, V1)
+                        per_cam_rot[:, :n] = rot_std
+                        per_cam_trans[:, :n] = trans_std
+                        gen = torch.Generator(device=self.device).manual_seed(
+                            self.config.pose_noise_seed
+                            + int(round(rot_std * 1e6)) + idx)
+                        ref_cams, pose_sigma_overrides = self._apply_pose_noise(
+                            ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
+                        if not self.config.model_config.use_pose_uncertainty:
+                            pose_sigma_overrides = None
+                    with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
+                        outputs = model(ref_imgs, ref_cams, tar_cams,
+                                        context_depths=context_depths,
+                                        pose_sigma_overrides=pose_sigma_overrides)
+                        outputs = torch.sigmoid(outputs)
+                    outputs = rearrange(outputs, "b v h w c -> (b v) c h w")
+                    tar_imgs = rearrange(tar_imgs, "b v h w c -> (b v) c h w")
+                    psnrs.append(state["psnr_fn"](outputs, tar_imgs))
+                    ssims.append(state["ssim_fn"](outputs, tar_imgs))
+                    lpips.append(state["lpips_fn"](outputs, tar_imgs))
+                avg_psnr, n_total = self._dist_avg(psnrs, "psnr", label)
+                avg_ssim, _ = self._dist_avg(ssims, "ssim", label)
+                avg_lpips, _ = self._dist_avg(lpips, "lpips", label)
+                self.logging_on_master(
+                    f"[pose-noise {tag}] PSNR{label}: {avg_psnr:.3f}, "
+                    f"SSIM: {avg_ssim:.3f}, LPIPS: {avg_lpips:.3f} "
+                    f"on {n_total} scenes at step {step} (rot={rot_std}, trans={trans_std})")
+                if self.world_rank == 0:
+                    self.writer.add_scalar(f"test/psnr_{tag}", avg_psnr, step)
+                    self.writer.add_scalar(f"test/ssim_{tag}", avg_ssim, step)
+                    self.writer.add_scalar(f"test/lpips_{tag}", avg_lpips, step)
+                    with open(f"{self.test_dir}/metrics_{tag}.json", "w") as f:
+                        json.dump({
+                            "label": label, "level_tag": tag,
+                            "rot_std": rot_std, "trans_std": trans_std,
+                            "step": step, "n_total": n_total,
+                            "psnr": avg_psnr, "ssim": avg_ssim, "lpips": avg_lpips,
+                        }, f)
+
     def test_iteration(self, step: int, state: Dict[str, Any]) -> None:
+        if self.config.pose_noise_enabled:
+            return self.pose_noise_test_sweep(step, state)
         dataloaders = state["dataloaders"]
         model = state["model"]
         model.eval()
