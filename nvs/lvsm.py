@@ -102,6 +102,11 @@ class LVSMDecoderOnlyModelConfig:
     # us re-fit the bank to the dataset's coord spread.
     freq_min_lambda: float = 0.1
     freq_max_lambda: float = 12.0
+    # flag_rope pose-uncertainty awareness (mode C). When True, flag_rope's plain
+    # precompute path perturbs the query-frame geometry per frequency block by the
+    # pose σ passed to forward() as ``pose_sigma_overrides`` (pose_rot/pose_trans
+    # only; depth stays with predict_dsig). No effect for RayRoPE.
+    use_pose_uncertainty: bool = False
     # Timing configuration
     timing_enabled: bool = False
 
@@ -197,6 +202,7 @@ class LVSMDecoderOnlyModel(nn.Module):
                 scene_scale_value=self.config.scene_scale_value,
                 frequency_min_lambda=self.config.freq_min_lambda,
                 frequency_max_lambda=self.config.freq_max_lambda,
+                use_pose_uncertainty=self.config.use_pose_uncertainty,
             )
             self.attention = FlagRoPEMultiQuerySdpaAttention(
                 config=flag_cfg,
@@ -315,6 +321,7 @@ class LVSMDecoderOnlyModel(nn.Module):
         tar_cams: Camera,
         context_depths: Optional[Tensor] = None,
         timing_enabled: bool = False,
+        pose_sigma_overrides: Optional[dict] = None,
     ) -> Tensor:
         
         with time_block("preprocess", enabled=timing_enabled):
@@ -374,7 +381,8 @@ class LVSMDecoderOnlyModel(nn.Module):
                 else:
                     depths_for_rope = None
                 self.attention._precompute_and_cache_apply_fns(
-                    w2cs=viewmats, Ks=Ks, context_depths=depths_for_rope
+                    w2cs=viewmats, Ks=Ks, context_depths=depths_for_rope,
+                    sigma_overrides=pose_sigma_overrides,
                 )
 
         def sdpa_fn(q, k, v, **sdpa_kwargs):
