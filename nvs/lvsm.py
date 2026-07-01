@@ -380,10 +380,12 @@ class LVSMDecoderOnlyModel(nn.Module):
                     depths_for_rope = repeat(context_depths, "b v1 h w 1 -> (b v2) v1 h w 1", v2=v2)
                 else:
                     depths_for_rope = None
-                self.attention._precompute_and_cache_apply_fns(
-                    w2cs=viewmats, Ks=Ks, context_depths=depths_for_rope,
-                    sigma_overrides=pose_sigma_overrides,
-                )
+                _pc_kwargs = dict(w2cs=viewmats, Ks=Ks, context_depths=depths_for_rope)
+                # sigma_overrides (pose σ) is only consumed by flag_rope mode C; other
+                # pos_enc (RayRoPE) _precompute_and_cache_apply_fns don't accept it.
+                if self.config.pos_enc == "flag_rope" and pose_sigma_overrides is not None:
+                    _pc_kwargs["sigma_overrides"] = pose_sigma_overrides
+                self.attention._precompute_and_cache_apply_fns(**_pc_kwargs)
 
         def sdpa_fn(q, k, v, **sdpa_kwargs):
             if config.pos_enc == "gta":

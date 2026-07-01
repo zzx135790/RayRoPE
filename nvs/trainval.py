@@ -248,8 +248,10 @@ class LVSMLauncher(Launcher):
             width=ref_cams.width, height=ref_cams.height,
         )
         V1 = ref_cams.camtoworld.shape[1]
-        V2 = tar_cams.camtoworld.shape[1]
-        C = V1 + V2
+        # LVSM forward repeats ref across V2 target views into the batch dim
+        # (b v2) and concatenates 1 target camera, so each forward sees C = V1+1
+        # cameras (NOT V1+V2). sigma_overrides must be sized for this C.
+        C = V1 + 1
         rot_full, trans_full = pad_to_full_camera_sigma(per_cam_rot, per_cam_trans, C)
         sigma_overrides = build_pose_sigma_overrides(rot_full, trans_full, self._num_patches())
         return new_ref_cams, sigma_overrides
