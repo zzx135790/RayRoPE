@@ -107,6 +107,31 @@ class LVSMDecoderOnlyModelConfig:
     # pose σ passed to forward() as ``pose_sigma_overrides`` (pose_rot/pose_trans
     # only; depth stays with predict_dsig). No effect for RayRoPE.
     use_pose_uncertainty: bool = False
+    # Soft cap on mode C pose-perturbation norm (None=unbounded). Prevents rare
+    # degenerate-batch NaN. No effect for RayRoPE / when use_pose_uncertainty=False.
+    pose_delta_cap: Optional[float] = None
+    # Model A (mode C only): couple the query-frame pose perturbation to the
+    # source-camera perturbation (same δ_c for both roles of camera c, Q=C) so
+    # same-camera pairs cancel exactly. False (default) = Model B, which leaks
+    # pose noise into same-camera attention. No effect unless use_pose_uncertainty.
+    pose_query_coupled: bool = False
+    # flag_rope X5: analytic CF decay (non-pairwise, Flash-fusable). Requires
+    # pose_query_coupled=True (Model A). Mutually exclusive with use_pose_uncertainty.
+    use_pose_uncertainty_cf: bool = False
+    # ── mode D: learnable recurrent (μ,σ) uncertainty (flag_rope only) ──
+    # The model SELF-ESTIMATES pose(+depth) (μ,σ) and refines them recurrently
+    # across 24 layers via a tied per-layer Δ head (stationary Markov kernel).
+    # μ₀=0 (input pose is the mean); σ₀=init (constant or true injected σ).
+    # Depth is unified into the 7-state (predict_d='none'; the point sinc
+    # integral consumes predicted_d=[μ_d,σ_d] from the recurrent state).
+    # Mutually exclusive with use_pose_uncertainty (mode C tells σ, mode D
+    # predicts σ). See flag_config.FlagRoPEConfig for field docs.
+    use_recurrent_uncertainty: bool = False
+    pose_mu_learnable: bool = True
+    pose_sigma_init: str = "constant"        # "constant" | "true"
+    pose_sigma_init_value: float = 1e-2
+    recurrent_mu_clamp: Optional[float] = None
+    recurrent_sigma_cap: Optional[float] = None
     # Timing configuration
     timing_enabled: bool = False
 
@@ -203,6 +228,17 @@ class LVSMDecoderOnlyModel(nn.Module):
                 frequency_min_lambda=self.config.freq_min_lambda,
                 frequency_max_lambda=self.config.freq_max_lambda,
                 use_pose_uncertainty=self.config.use_pose_uncertainty,
+                pose_delta_cap=self.config.pose_delta_cap,
+                pose_query_coupled=self.config.pose_query_coupled,
+                use_pose_uncertainty_cf=self.config.use_pose_uncertainty_cf,
+                use_recurrent_uncertainty=self.config.use_recurrent_uncertainty,
+                pose_mu_learnable=self.config.pose_mu_learnable,
+                pose_sigma_init=self.config.pose_sigma_init,
+                pose_sigma_init_value=self.config.pose_sigma_init_value,
+                recurrent_mu_clamp=self.config.recurrent_mu_clamp,
+                recurrent_sigma_cap=self.config.recurrent_sigma_cap,
+                recurrent_init_depth=self.config.init_d,
+                recurrent_init_sigma=self.config.init_sig,
             )
             self.attention = FlagRoPEMultiQuerySdpaAttention(
                 config=flag_cfg,
@@ -254,6 +290,13 @@ class LVSMDecoderOnlyModel(nn.Module):
             self.config.encoder.layer.predict_d = 'dsig_perhead'
         self.config.encoder.layer.init_depth = self.config.init_d
         self.config.encoder.layer.init_sigma = self.config.init_sig
+        # mode D: depth comes from the recurrent 7-state, so disable the
+        # separate predict_dsig depth head (avoid two depth heads competing)
+        # and enable the per-layer Δ head (tied across clones). predict_d is
+        # forced to 'none' regardless of depth_type when mode D is on.
+        if self.config.use_recurrent_uncertainty:
+            self.config.encoder.layer.predict_d = 'none'
+            self.config.encoder.layer.predict_delta = True
         
         self.encoder = self.config.encoder.setup()
 
@@ -322,8 +365,9 @@ class LVSMDecoderOnlyModel(nn.Module):
         context_depths: Optional[Tensor] = None,
         timing_enabled: bool = False,
         pose_sigma_overrides: Optional[dict] = None,
+        pose_sigma_seed: Optional[dict] = None,
     ) -> Tensor:
-        
+
         with time_block("preprocess", enabled=timing_enabled):
             # ref_imgs: [B, V1, H, W, C]
             # tar_imgs: [B, V2, H, W, C]
@@ -381,10 +425,22 @@ class LVSMDecoderOnlyModel(nn.Module):
                 else:
                     depths_for_rope = None
                 _pc_kwargs = dict(w2cs=viewmats, Ks=Ks, context_depths=depths_for_rope)
-                # sigma_overrides (pose σ) is only consumed by flag_rope mode C; other
-                # pos_enc (RayRoPE) _precompute_and_cache_apply_fns don't accept it.
-                if self.config.pos_enc == "flag_rope" and pose_sigma_overrides is not None:
-                    _pc_kwargs["sigma_overrides"] = pose_sigma_overrides
+                # flag_rope uncertainty σ routing:
+                #   mode C (use_pose_uncertainty): pose_sigma_overrides = the TRUE
+                #     injected σ, used to perturb geometry per frequency block.
+                #   mode D (use_recurrent_uncertainty): pose_sigma_seed = the TRUE
+                #     injected σ, used ONLY to seed σ₀ (teacher-forcing) when
+                #     pose_sigma_init=="true"; the per-layer perturbation comes
+                #     from the recurrent σ (model self-estimates). At test no σ
+                #     is passed (head recovers σ from features).
+                # Other pos_enc (RayRoPE) _precompute_and_cache_apply_fns don't
+                # accept sigma_overrides.
+                if self.config.pos_enc == "flag_rope":
+                    if self.config.use_recurrent_uncertainty:
+                        if pose_sigma_seed is not None:
+                            _pc_kwargs["sigma_overrides"] = pose_sigma_seed
+                    elif pose_sigma_overrides is not None:
+                        _pc_kwargs["sigma_overrides"] = pose_sigma_overrides
                 self.attention._precompute_and_cache_apply_fns(**_pc_kwargs)
 
         def sdpa_fn(q, k, v, **sdpa_kwargs):
