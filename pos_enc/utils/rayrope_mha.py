@@ -59,12 +59,14 @@ class MultiheadAttention(torch.nn.Module):
         init_sigma: float = 3.0,
         sdpa_fn: Optional[Callable] = F.scaled_dot_product_attention,
         cross_attn: bool = False, # set to True if used for cross-attention
+        predict_delta: bool = False, # mode D: per-layer Δ(μ,σ) head for flag_rope
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
         self.predict_d = predict_d
+        self.predict_delta = predict_delta
         self.dropout = dropout
         self.bias = bias
         self.qk_norm = qk_norm
@@ -96,6 +98,20 @@ class MultiheadAttention(torch.nn.Module):
         else:
             self.register_parameter("d_proj_weight", None)
             self.register_parameter("d_proj_bias", None)
+
+        # mode D Δ head: outputs [Δμ_rot3, Δμ_trans3, Δμ_depth1, Δσ_rot3,
+        # Δσ_trans3, Δσ_depth1] = 14. Zero weight + zero bias ⇒ Δ≈0 ⇒ the
+        # recurrent (μ,σ) state starts at (μ₀, σ₀) and is a no-op until
+        # learned. Weights are TIED across all 24 layer clones by the
+        # TransformerEncoder (shared Parameter object) ⇒ a stationary Markov
+        # refinement kernel. predict_d='none' in mode D (depth comes from the
+        # recurrent state, not this head), so the two heads never compete.
+        if predict_delta:
+            self.delta_proj_weight = Parameter(torch.zeros((14, embed_dim)))
+            self.delta_proj_bias = Parameter(torch.zeros(14))
+        else:
+            self.register_parameter("delta_proj_weight", None)
+            self.register_parameter("delta_proj_bias", None)
         self._reset_parameters()
 
     def _reset_parameters(self):
@@ -133,7 +149,16 @@ class MultiheadAttention(torch.nn.Module):
                 raw_d_kv = F.linear(key, self.d_proj_weight, self.d_proj_bias)
             else:
                 raw_d_kv = None
-            
+
+        # mode D Δ head: per-layer (Δμ, Δσ) from query features. Forwarded to
+        # the flag_rope attention via sdpa_fn's **kwargs (delta_state); ignored
+        # by non-flag_rope sdpa_fns since predict_delta is only enabled there.
+        extra_kwargs = {}
+        if self.predict_delta:
+            extra_kwargs["delta_state"] = F.linear(
+                query, self.delta_proj_weight, self.delta_proj_bias
+            )
+
         q_proj_weight, k_proj_weight, v_proj_weight = self.in_proj_weight.chunk(
             3, dim=0
         )
@@ -155,9 +180,10 @@ class MultiheadAttention(torch.nn.Module):
 
         if self.predict_d != 'none':
             o = sdpa_fn(q, k, v, dropout_p=self.dropout if self.training else 0.0,
-                        predicted_d=raw_d, predicted_d_kv=raw_d_kv)
+                        predicted_d=raw_d, predicted_d_kv=raw_d_kv, **extra_kwargs)
         else:
-            o = sdpa_fn(q, k, v, dropout_p=self.dropout if self.training else 0.0)
+            o = sdpa_fn(q, k, v, dropout_p=self.dropout if self.training else 0.0,
+                        **extra_kwargs)
         
         # with time_block("get_features", enabled=True):
         o = rearrange(o, "b h t c -> b t (h c)", h=self.num_heads)

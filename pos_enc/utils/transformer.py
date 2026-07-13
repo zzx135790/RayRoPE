@@ -56,6 +56,12 @@ class TransformerLayerConfig:
     # actually take effect (previously hardcoded to 0.0/3.0 in the MHA).
     init_depth: float = 0.0
     init_sigma: float = 3.0
+    # mode D (flag_rope recurrent uncertainty): each layer's MHA gets a Δ head
+    # outputting (Δμ, Δσ) for the 7-state [rot3, trans3, depth1]. The
+    # TransformerEncoder TIES these weights across all layer clones (shared
+    # Parameter) ⇒ a stationary Markov refinement kernel. Mutually exclusive
+    # with predict_d='predict_dsig' in practice (mode D sets predict_d='none').
+    predict_delta: bool = False
 
 
 @dataclass
@@ -103,6 +109,18 @@ class TransformerEncoder(Module):
         encoder_layer = cfg.layer.setup()
         self.layers = _get_clones(encoder_layer, cfg.num_layers)
         self.num_layers = cfg.num_layers
+        # mode D: TIE the Δ head across all layer clones so the same refinement
+        # operator is applied every layer (stationary Markov kernel). _get_clones
+        # deep-copies, so without this each clone has independent Δ weights
+        # (non-stationary). Reassigning a Parameter attribute on an nn.Module
+        # replaces the registered parameter in-place, so all clones end up
+        # sharing clone[0]'s Parameter object (one set of grads, applied 24×).
+        if cfg.layer.predict_delta:
+            shared_w = self.layers[0].self_attn.delta_proj_weight
+            shared_b = self.layers[0].self_attn.delta_proj_bias
+            for layer in self.layers[1:]:
+                layer.self_attn.delta_proj_weight = shared_w
+                layer.self_attn.delta_proj_bias = shared_b
         self.in_norm = (
             LayerNorm(
                 cfg.layer.d_model,
@@ -251,6 +269,7 @@ class TransformerEncoderLayer(Module):
             predict_d=cfg.predict_d,
             init_depth=cfg.init_depth,
             init_sigma=cfg.init_sigma,
+            predict_delta=cfg.predict_delta,
         )
         # Implementation of Feedforward model
         self.linear1 = Linear(cfg.d_model, cfg.dim_feedforward, bias=cfg.bias)

@@ -157,6 +157,14 @@ class LVSMLauncherConfig(LauncherConfig):
     pose_noise_test_levels: str = "0,0.01,0.02,0.05,0.1"  # rot level list (=trans level)
     pose_noise_test_corrupt: int = 2  # test: fixed N of ref corrupted
     pose_noise_seed: int = 1234
+    # X1 (σ-intervention): transform the σ told to a pose-aware model AT TEST time,
+    # holding the actual input corruption fixed. Probes whether the model functionally
+    # uses the σ channel. "true" = tell the real injected σ (default); "zero" = tell σ=0
+    # (mode C no-op ⇒ plain path on corrupted input); "half"/"double" = scale σ;
+    # "permute" = move the σ mask to the WRONG cameras (σ on uncorrupted cams, 0 on
+    # corrupted). Only takes effect when the model is pose-aware (use_pose_uncertainty)
+    # and pose_noise_enabled; blind/RayRoPE ignore it (they get None anyway).
+    pose_noise_test_sigma_transform: str = "true"
 
 
 class LVSMLauncher(Launcher):
@@ -281,6 +289,49 @@ class LVSMLauncher(Launcher):
             v = float(s)
             tag = "clean" if v == 0.0 else f"rot{v}"
             out.append((v, v, tag))  # rot_std = trans_std = level
+        return out
+
+    @staticmethod
+    def _transform_test_sigma(
+        overrides: Optional[dict], n_corrupt: int, num_patches: int, transform: str,
+    ) -> Optional[dict]:
+        """X1: rewrite the σ told to a pose-aware model at test time.
+
+        ``overrides`` is the dict from ``_apply_pose_noise`` (keys pose_rot /
+        pose_trans shaped [B, 1, N] — camera folded into the token axis, token
+        n belonging to camera n//num_patches; K/depth already 0 in mode C). The
+        actual input corruption is unchanged — only the σ channel is transformed.
+          zero     → tell σ=0 (mode C no-op; plain path on corrupted input)
+          half     → σ × 0.5
+          double   → σ × 2.0
+          permute  → move the σ from cams [0:n] to cams [n:2n]
+                     (corrupted cams told clean, clean cams told corrupted).
+        """
+        if overrides is None or transform == "true":
+            return overrides
+        if transform == "zero":
+            return None  # σ=0 ⇒ mode C no-op ⇒ plain path (≡ telling σ=0)
+        out = {k: v.clone() for k, v in overrides.items()}
+        if transform in ("half", "double"):
+            scale = 0.5 if transform == "half" else 2.0
+            for k in ("pose_rot", "pose_trans"):
+                if k in out:
+                    out[k] = out[k] * scale
+        elif transform.startswith("scale:"):
+            scale = float(transform.split(":", 1)[1])
+            for k in ("pose_rot", "pose_trans"):
+                if k in out:
+                    out[k] = out[k] * scale
+        elif transform == "permute":
+            # σ lives on tokens [0 : n*P] (cams [0:n]). Move it to tokens
+            # [n*P : 2n*P] (cams [n:2n]): corrupted cams told clean, clean cams
+            # told corrupted. Overrides are [B, 1, N]; roll the token axis (dim 2).
+            shift = n_corrupt * num_patches
+            for k in ("pose_rot", "pose_trans"):
+                if k in out:
+                    out[k] = torch.roll(out[k], shifts=shift, dims=2)
+        else:
+            raise ValueError(f"unknown sigma transform: {transform!r}")
         return out
 
     def train_initialize(self) -> Dict[str, Any]:
@@ -436,6 +487,7 @@ class LVSMLauncher(Launcher):
         # told to flag_rope (pose-aware) via pose_sigma_overrides; blind/RayRoPE
         # get None (process corrupted input blind).
         pose_sigma_overrides = None
+        pose_sigma_seed = None
         if self.config.pose_noise_enabled:
             V1 = ref_cams.camtoworld.shape[1]
             B = ref_cams.camtoworld.shape[0]
@@ -453,7 +505,17 @@ class LVSMLauncher(Launcher):
             per_cam_trans = torch.where(mask, trans_std[:, None], torch.zeros_like(trans_std[:, None]))
             ref_cams, pose_sigma_overrides = self._apply_pose_noise(
                 ref_cams, tar_cams, per_cam_rot, per_cam_trans)
-            if not self.config.model_config.use_pose_uncertainty:
+            pose_sigma_seed = None
+            mc = self.config.model_config
+            if mc.use_recurrent_uncertainty:
+                # mode D: the model SELF-ESTIMATES σ (not told). Don't pass
+                # pose_sigma_overrides. But for pose_sigma_init=="true", seed σ₀
+                # from the real injected σ (teacher-forcing σ₀ during train);
+                # the per-layer perturbation still comes from the recurrent σ.
+                if mc.pose_sigma_init == "true":
+                    pose_sigma_seed = pose_sigma_overrides
+                pose_sigma_overrides = None
+            elif not mc.use_pose_uncertainty:
                 pose_sigma_overrides = None  # blind / RayRoPE: don't tell the model
 
         # Enable timing only for rank 0 to avoid overhead
@@ -466,7 +528,8 @@ class LVSMLauncher(Launcher):
                 outputs = model(ref_imgs, ref_cams, tar_cams,
                         context_depths=context_depths,
                         timing_enabled=timing_enabled,
-                        pose_sigma_overrides=pose_sigma_overrides)
+                        pose_sigma_overrides=pose_sigma_overrides,
+                        pose_sigma_seed=pose_sigma_seed)
                 outputs = torch.sigmoid(outputs)
 
                 if self.config.get_mask:
@@ -590,6 +653,32 @@ class LVSMLauncher(Launcher):
             self.writer.add_scalar("train/psnr", psnr, step)
             # self.writer.add_scalar("train/ssim", ssim, step)
             # self.writer.add_scalar("train/lpips", lpips, step)
+
+            # mode D σ-collapse diagnostic (audit③): log the FINAL recurrent σ
+            # (after all layers) so we can tell whether σ → 0 (model shuts off
+            # the perturbation ⇒ mode D ≈ blind, reprise of the mode-C null
+            # result) or stays meaningful. Also log μ drift. The recurrent
+            # state holds the post-24-layer (μ, σ); per-layer trajectory is not
+            # recorded (checkpointing recomputes forward, so a history list
+            # would be fragile — the final value is the stable signal).
+            mc = self.config.model_config
+            if getattr(mc, "use_recurrent_uncertainty", False):
+                att = getattr(model, "attention", None)
+                rs = getattr(att, "_recurrent_state", None)
+                if rs is not None:
+                    sig_raw = rs["sigma"].detach()
+                    mu = rs["mu"].detach()
+                    sig_pose = torch.nn.functional.softplus(sig_raw[..., :6])
+                    self.writer.add_scalar("modeD/sig_pose_mean", sig_pose.mean().item(), step)
+                    self.writer.add_scalar("modeD/sig_pose_max", sig_pose.max().item(), step)
+                    self.writer.add_scalar("modeD/sig_pose_frac_lt1e-3",
+                                           (sig_pose < 1e-3).float().mean().item(), step)
+                    self.writer.add_scalar("modeD/sig_depth_mean",
+                                           sig_raw[..., 6].mean().item(), step)
+                    self.writer.add_scalar("modeD/mu_pose_absmax",
+                                           mu[..., :6].abs().max().item(), step)
+                    self.writer.add_scalar("modeD/mu_depth_mean",
+                                           mu[..., 6].mean().item(), step)
             
             # Log timing stats to tensorboard
             if timing_enabled and timing_stats:
@@ -825,6 +914,10 @@ class LVSMLauncher(Launcher):
                             ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
                         if not self.config.model_config.use_pose_uncertainty:
                             pose_sigma_overrides = None
+                        elif self.config.pose_noise_test_sigma_transform != "true":
+                            pose_sigma_overrides = self._transform_test_sigma(
+                                pose_sigma_overrides, n, self._num_patches(),
+                                self.config.pose_noise_test_sigma_transform)
                     with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
                         outputs = model(ref_imgs, ref_cams, tar_cams,
                                         context_depths=context_depths,
