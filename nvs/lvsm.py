@@ -118,6 +118,11 @@ class LVSMDecoderOnlyModelConfig:
     # flag_rope X5: analytic CF decay (non-pairwise, Flash-fusable). Requires
     # pose_query_coupled=True (Model A). Mutually exclusive with use_pose_uncertainty.
     use_pose_uncertainty_cf: bool = False
+    # flag_rope bilateral CF (NBV axis ② arm): also marginalise the query-side
+    # pose in the CF path (J_source+J_query). Same-cam decay=1 by invariance
+    # (no hard mask); cross-cam Var doubles vs source-only. Defaults False to
+    # preserve X5/flag_aware_CF source-only behaviour. See FlagRoPEConfig.
+    use_bilateral_cf: bool = False
     # ── mode D: learnable recurrent (μ,σ) uncertainty (flag_rope only) ──
     # The model SELF-ESTIMATES pose(+depth) (μ,σ) and refines them recurrently
     # across 24 layers via a tied per-layer Δ head (stationary Markov kernel).
@@ -231,6 +236,7 @@ class LVSMDecoderOnlyModel(nn.Module):
                 pose_delta_cap=self.config.pose_delta_cap,
                 pose_query_coupled=self.config.pose_query_coupled,
                 use_pose_uncertainty_cf=self.config.use_pose_uncertainty_cf,
+                use_bilateral_cf=self.config.use_bilateral_cf,
                 use_recurrent_uncertainty=self.config.use_recurrent_uncertainty,
                 pose_mu_learnable=self.config.pose_mu_learnable,
                 pose_sigma_init=self.config.pose_sigma_init,
