@@ -2,6 +2,7 @@ import glob
 import json
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -35,6 +36,14 @@ from nvs.perceptual import Perceptual
 from pos_enc.utils.functional import random_SO3
 from pos_enc.utils.runner import Launcher, LauncherConfig, nested_to_device
 from pos_enc.timing_utils import time_block, get_timing_stats
+
+
+_REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _repository_path(relative_path: str) -> str:
+    return str(_REPOSITORY_ROOT / relative_path)
+
 
 def write_tensor_to_image(
     x: Tensor,
@@ -89,9 +98,15 @@ class LVSMLauncherConfig(LauncherConfig):
     objaverse_test_spherical_index_file: str = "assets/objaverse_index_test_context2_spherical.json"
 
     # co3d specific config
-    co3d_test_seen_index_file: str = "assets/co3d_test_context2_seen.json"
-    co3d_test_unseen_index_file: str = "assets/co3d_test_context2_unseen.json"
-    co3d_test_full_index_file: str = "assets/co3d_test_context2_full.json"
+    co3d_test_seen_index_file: str = _repository_path(
+        "assets/co3d_test_context2_seen.json"
+    )
+    co3d_test_unseen_index_file: str = _repository_path(
+        "assets/co3d_test_context2_unseen.json"
+    )
+    co3d_test_full_index_file: str = _repository_path(
+        "assets/co3d_test_context2_full.json"
+    )
 
     co3d_train_categories: tuple[str, ...] = ("seen",)
     co3d_test_unseen: bool = False

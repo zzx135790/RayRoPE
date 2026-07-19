@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -62,3 +63,20 @@ def test_selected_dataset_rejects_relative_paths() -> None:
                 "RE10K_TEST_DIR": "/synthetic/re10k/test",
             },
         )
+
+
+def test_default_co3d_evaluation_index_is_module_absolute_when_cwd_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import nvs.trainval as trainval
+
+    monkeypatch.chdir(tmp_path)
+
+    config = trainval.LVSMLauncherConfig()
+
+    expected = (
+        Path(trainval.__file__).resolve().parent.parent
+        / "assets/co3d_test_context2_seen.json"
+    )
+    assert Path(config.co3d_test_seen_index_file) == expected
+    assert Path(config.co3d_test_seen_index_file).is_absolute()
