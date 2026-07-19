@@ -24,12 +24,29 @@ class DatasetEnvironmentError(RuntimeError):
 
     dataset: str
     missing: tuple[str, ...]
+    invalid: tuple[tuple[str, str], ...]
 
-    def __init__(self, dataset: str, missing: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        dataset: str,
+        missing: tuple[str, ...],
+        *,
+        invalid: tuple[tuple[str, str], ...] = (),
+    ) -> None:
         self.dataset = dataset
         self.missing = tuple(sorted(missing))
-        missing_names = ", ".join(self.missing)
-        super().__init__(f"Dataset {dataset!r} requires environment variables: {missing_names}")
+        self.invalid = tuple(sorted(invalid))
+        if self.missing:
+            missing_names = ", ".join(self.missing)
+            message = f"Dataset {dataset!r} requires environment variables: {missing_names}"
+        else:
+            invalid_paths = ", ".join(
+                f"{name}={value!r}" for name, value in self.invalid
+            )
+            message = (
+                f"Dataset {dataset!r} requires absolute environment paths: {invalid_paths}"
+            )
+        super().__init__(message)
 
 
 _REQUIRED_VARIABLES = {
@@ -54,6 +71,13 @@ def dataset_paths_for(
     missing = tuple(name for name in required if not values[name])
     if missing:
         raise DatasetEnvironmentError(dataset, missing)
+    invalid = tuple(
+        (name, value)
+        for name, value in values.items()
+        if value is not None and not os.path.isabs(value)
+    )
+    if invalid:
+        raise DatasetEnvironmentError(dataset, (), invalid=invalid)
 
     if dataset == "re10k":
         return DatasetPaths(

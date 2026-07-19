@@ -47,3 +47,18 @@ def test_selected_dataset_reads_only_its_declared_environment() -> None:
     assert co3d.root == "/synthetic/co3d/images"
     assert co3d.annotation == "/synthetic/co3d/annotations"
     assert co3d.depth == "/synthetic/co3d/depth"
+
+
+def test_selected_dataset_rejects_relative_paths() -> None:
+    from nvs.runtime_paths import DatasetEnvironmentError, dataset_paths_for
+
+    with pytest.raises(
+        DatasetEnvironmentError, match=r"RE10K_TRAIN_DIR.*relative/train"
+    ):
+        dataset_paths_for(
+            "re10k",
+            {
+                "RE10K_TRAIN_DIR": "relative/train",
+                "RE10K_TEST_DIR": "/synthetic/re10k/test",
+            },
+        )
