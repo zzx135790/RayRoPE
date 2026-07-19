@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import gzip
 import json
-import os
 import os.path as osp
 import random
-import socket
 import time
 import warnings
 from dataclasses import dataclass
@@ -17,14 +15,6 @@ from PIL import Image, ImageFile
 from scipy import ndimage as nd
 from torch.utils.data import Dataset
 import cv2
-
-# ---------------------------------------------------------------------------
-# Environment-specific defaults
-# ---------------------------------------------------------------------------
-HOSTNAME = socket.gethostname()
-CO3D_DIR: Optional[str] = os.environ["CO3D_DIR"]
-CO3D_ANNOTATION_DIR: Optional[str] = os.environ["CO3D_ANNOTATION_DIR"]
-CO3D_DEPTH_DIR: Optional[str] = os.environ["CO3D_DEPTH_DIR"]
 
 Image.MAX_IMAGE_PIXELS = None
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -369,9 +359,9 @@ class _Co3dBaseDataset(Dataset):
         self.depth_size = depth_size or patch_size
         self.load_depth = load_depth
 
-        self.co3d_dir = co3d_dir or CO3D_DIR
-        self.annotation_dir = annotation_dir or CO3D_ANNOTATION_DIR
-        self.depth_dir = depth_dir or CO3D_DEPTH_DIR
+        self.co3d_dir = co3d_dir
+        self.annotation_dir = annotation_dir
+        self.depth_dir = depth_dir
 
         if self.co3d_dir is None or self.annotation_dir is None:
             raise RuntimeError("CO3D dataset paths are not configured.")

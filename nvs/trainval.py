@@ -19,6 +19,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from nvs.re10k_dataset import RE10K_TrainDataset, RE10K_EvalDataset, _normalize_poses_identity_unit_distance
 from nvs.objaverse_dataset import ObjaverseTrainDataset, ObjaverseEvalDataset
 from nvs.co3d_dataset import Co3dTrainDataset, Co3dEvalDataset
+from nvs.runtime_paths import dataset_paths_for
 from nvs.lvsm import (
     Camera,
     LVSMDecoderOnlyModel,
@@ -34,14 +35,6 @@ from nvs.perceptual import Perceptual
 from pos_enc.utils.functional import random_SO3
 from pos_enc.utils.runner import Launcher, LauncherConfig, nested_to_device
 from pos_enc.timing_utils import time_block, get_timing_stats
-
-# Get machine-dependent paths from environment variables
-RE10K_TRAIN_DIR = os.environ["RE10K_TRAIN_DIR"]
-RE10K_TEST_DIR = os.environ["RE10K_TEST_DIR"]
-OBJV_DIR = os.environ["OBJV_DIR"]
-CO3D_DIR = os.environ["CO3D_DIR"]
-CO3D_ANNOTATION_DIR = os.environ["CO3D_ANNOTATION_DIR"]
-CO3D_DEPTH_DIR = os.environ["CO3D_DEPTH_DIR"]
 
 def write_tensor_to_image(
     x: Tensor,
@@ -337,11 +330,12 @@ class LVSMLauncher(Launcher):
     def train_initialize(self) -> Dict[str, Any]:
         # ------------- Setup Data. ------------- #       
         if self.config.dataset == "re10k":
+            paths = dataset_paths_for("re10k")
             # glob(*) would also pick up non-scene files (e.g. full_list.txt in
             # our re10k layout); keep only scene sub-directories that hold a
             # transforms.json. Data-layout adaptation only — no logic change.
             scenes = sorted(
-                d for d in glob.glob(f"{RE10K_TRAIN_DIR}/*")
+                d for d in glob.glob(f"{paths.train}/*")
                 if os.path.isdir(d) and os.path.exists(os.path.join(d, "transforms.json"))
             )
             dataset = RE10K_TrainDataset(
@@ -353,7 +347,8 @@ class LVSMLauncher(Launcher):
                 supervise_views=self.config.dataset_supervise_views,
             )
         elif self.config.dataset == "objaverse":
-            scenes = sorted(glob.glob(f"{OBJV_DIR}/*"))
+            paths = dataset_paths_for("objaverse")
+            scenes = sorted(glob.glob(f"{paths.root}/*"))
             index_file = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)), 
                 f"../{self.config.objaverse_train_index_file}"
@@ -370,6 +365,7 @@ class LVSMLauncher(Launcher):
                 get_mask=self.config.get_mask,
             )
         elif self.config.dataset == "co3d":
+            paths = dataset_paths_for("co3d")
             get_depth = ("known" in self.config.model_config.depth_type) \
                 or self.config.model_config.depth_input
             dataset = Co3dTrainDataset(
@@ -378,9 +374,9 @@ class LVSMLauncher(Launcher):
                 input_views=2,
                 supervise_views=self.config.dataset_supervise_views,
                 load_depth=get_depth,
-                co3d_dir=CO3D_DIR,
-                annotation_dir=CO3D_ANNOTATION_DIR,
-                depth_dir=CO3D_DEPTH_DIR,
+                co3d_dir=paths.root,
+                annotation_dir=paths.annotation,
+                depth_dir=paths.depth,
             )
         else:
             raise ValueError(f"Unknown dataset: {self.config.dataset}")
@@ -705,6 +701,7 @@ class LVSMLauncher(Launcher):
         print(f"test zoom_factor: {self.config.test_zoom_factor}, random_zoom: {self.config.test_random_zoom}")
         
         if self.config.dataset == "re10k":
+            paths = dataset_paths_for("re10k")
             if not self.config.render_video and self.config.test_index_fp is None:
                 assert (
                     (self.config.test_input_views == 2
@@ -716,7 +713,7 @@ class LVSMLauncher(Launcher):
             
             for zoom_factor in self.config.test_zoom_factor:
                 dataset = RE10K_EvalDataset(
-                    folder=RE10K_TEST_DIR,
+                    folder=paths.test,
                     patch_size=self.config.dataset_patch_size,
                     zoom_factor=zoom_factor,
                     random_zoom=self.config.test_random_zoom,
@@ -736,12 +733,13 @@ class LVSMLauncher(Launcher):
                     ),
                 )
         elif self.config.dataset == "objaverse":            
+            paths = dataset_paths_for("objaverse")
             get_depth = ("known" in self.config.model_config.depth_type) \
                 or self.config.model_config.depth_input
             # get_depth = True
             if self.config.test_rad_sph:
                 # radial
-                scenes = sorted(glob.glob(f"{OBJV_DIR}/*"))
+                scenes = sorted(glob.glob(f"{paths.root}/*"))
                 index_file = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), 
                     f"../{self.config.objaverse_test_radial_index_file}"
@@ -786,7 +784,7 @@ class LVSMLauncher(Launcher):
                     ),
                 )
             else:
-                scenes = sorted(glob.glob(f"{OBJV_DIR}/*"))
+                scenes = sorted(glob.glob(f"{paths.root}/*"))
                 index_file = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), 
                     f"../{self.config.objaverse_test_index_file}"
@@ -810,6 +808,7 @@ class LVSMLauncher(Launcher):
                     ),
                 )
         elif self.config.dataset == "co3d":
+            paths = dataset_paths_for("co3d")
             get_depth = ("known" in self.config.model_config.depth_type) \
                 or self.config.model_config.depth_input
             dataset_seen = Co3dEvalDataset(
@@ -820,9 +819,9 @@ class LVSMLauncher(Launcher):
                 first_n=self.config.test_n,
                 load_depth=get_depth,
                 render_video=self.config.render_video,
-                co3d_dir=CO3D_DIR,
-                annotation_dir=CO3D_ANNOTATION_DIR,
-                depth_dir=CO3D_DEPTH_DIR,
+                co3d_dir=paths.root,
+                annotation_dir=paths.annotation,
+                depth_dir=paths.depth,
             )
             dataloaders["seen"] = (
                 self.config.test_input_views,
@@ -838,9 +837,9 @@ class LVSMLauncher(Launcher):
                     input_views=self.config.test_input_views,
                     first_n=self.config.test_n,
                     load_depth=get_depth,
-                    co3d_dir=CO3D_DIR,
-                    annotation_dir=CO3D_ANNOTATION_DIR,
-                    depth_dir=CO3D_DEPTH_DIR,
+                    co3d_dir=paths.root,
+                    annotation_dir=paths.annotation,
+                    depth_dir=paths.depth,
                 )
                 dataloaders["unseen"] = (
                     self.config.test_input_views,

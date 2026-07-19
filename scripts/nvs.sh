@@ -1,32 +1,10 @@
 #! /bin/bash
-source ~/.bashrc
-conda activate rayrope
 
-# Machine-dependent paths
-HOSTNAME=$(hostname)
-LOG_ROOT="./rayrope_out" # where model ckpts, logs, visual outputs are saved. Feel free to change.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+REPOSITORY_ROOT=$(cd -- "${SCRIPT_DIR}/.." && pwd -P)
+PYTHON_BIN=${PYTHON:-python}
 
-# Dataset paths
-# TODO: Replace the following paths with your dataset paths
-export RE10K_TRAIN_DIR="/grogu/datasets/realestate/re10k_processed/train" # Replace with {YOUR_RE10K_DIR}/re10k_processed/train
-export RE10K_TEST_DIR="/grogu/datasets/realestate/re10k_processed/test" # Replace with {YOUR_RE10K_DIR}/re10k_processed/test
-export OBJV_DIR="/grogu/user/yuwu3/objaverse80k_sp/data" # Replace with the path to your Objaverse
-export CO3D_DIR="/grogu/datasets/co3d"
-export CO3D_ANNOTATION_DIR="/grogu/user/amylin2/co3d_v2_annotations"
-export CO3D_DEPTH_DIR="/grogu/datasets/co3d"
-
-# Auto-detect GPUs
-# NGPUS=$(nvidia-smi -L | wc -l)
-# GPU_INDICES=$(nvidia-smi --query-gpu=index --format=csv,noheader | tr '\n' ',' | sed 's/,$//')
-
-# Or manually set GPUs
-NGPUS=1
-GPU_INDICES="0"
-export CUDA_VISIBLE_DEVICES=$GPU_INDICES
-echo "Using $NGPUS GPUs: $CUDA_VISIBLE_DEVICES"
-
-export PYTHONPATH=${PYTHONPATH}:.
-export TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_${SLURM_JOB_ID}_${RANK}
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${REPOSITORY_ROOT}"
 export TORCHINDUCTOR_DISABLE_AUTOTUNE_CACHE=1
 export TORCHINDUCTOR_FORCE_RECOMPILE=1
 
@@ -57,6 +35,9 @@ P_LOSS_W=0.5
 BG_LOSS_W=1.0
 PDB_MODE=false
 TEST_N=200 # test first N scenes when rendering video/view is enabled
+
+unset RE10K_TRAIN_DIR_OVERRIDE RE10K_TEST_DIR_OVERRIDE
+unset OBJV_DIR_OVERRIDE CO3D_DIR_OVERRIDE CO3D_ANNOTATION_DIR_OVERRIDE CO3D_DEPTH_DIR_OVERRIDE
 
 
 # Argument Parsing
@@ -92,6 +73,12 @@ while [[ $# -gt 0 ]]; do
     --test-ckpt) TEST_CKPT="$2"; shift 2 ;;
     --pdb) PDB_MODE=true; shift 1 ;;
     --output-dir) OUTPUT_DIR_OVERRIDE="$2"; shift 2 ;;
+    --re10k-train-dir) RE10K_TRAIN_DIR_OVERRIDE="$2"; shift 2 ;;
+    --re10k-test-dir) RE10K_TEST_DIR_OVERRIDE="$2"; shift 2 ;;
+    --objv-dir) OBJV_DIR_OVERRIDE="$2"; shift 2 ;;
+    --co3d-dir) CO3D_DIR_OVERRIDE="$2"; shift 2 ;;
+    --co3d-annotation-dir) CO3D_ANNOTATION_DIR_OVERRIDE="$2"; shift 2 ;;
+    --co3d-depth-dir) CO3D_DEPTH_DIR_OVERRIDE="$2"; shift 2 ;;
     --test-n) TEST_N="$2"; shift 2 ;;
     -h|--help)
       echo "Usage: $0 [options]"
@@ -100,6 +87,12 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Dataset Options:"
       echo "  --dataset <name>          Dataset to use: re10k, objaverse, or co3d (default: co3d)"
+      echo "  --re10k-train-dir <path> Absolute RE10K training directory (overrides environment)"
+      echo "  --re10k-test-dir <path>  Absolute RE10K test directory (overrides environment)"
+      echo "  --objv-dir <path>        Absolute Objaverse directory (overrides environment)"
+      echo "  --co3d-dir <path>        Absolute CO3D image directory (overrides environment)"
+      echo "  --co3d-annotation-dir <path>  Absolute CO3D annotation directory (overrides environment)"
+      echo "  --co3d-depth-dir <path>  Absolute CO3D depth directory (overrides environment)"
       echo "  --category <name>         CO3D category: 'seen' or specific category name (default: seen)"
       echo ""
       echo "Positional Encoding Options:"
@@ -145,6 +138,68 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+for override in \
+  RE10K_TRAIN_DIR RE10K_TEST_DIR OBJV_DIR CO3D_DIR CO3D_ANNOTATION_DIR CO3D_DEPTH_DIR; do
+  override_name="${override}_OVERRIDE"
+  if [[ -v ${override_name} ]]; then
+    export "${override}=${!override_name}"
+  fi
+done
+
+require_absolute_path() {
+  local variable_name=$1
+  local value=${!variable_name:-}
+  if [[ -z "${value}" ]]; then
+    echo "Missing required environment variable for ${DATASET}: ${variable_name}" >&2
+    exit 2
+  fi
+  if [[ "${value}" != /* ]]; then
+    echo "${variable_name} must be an absolute path: ${value}" >&2
+    exit 2
+  fi
+}
+
+require_value() {
+  local variable_name=$1
+  local value=${!variable_name:-}
+  if [[ -z "${value}" ]]; then
+    echo "Missing required environment variable: ${variable_name}" >&2
+    exit 2
+  fi
+}
+
+case "${DATASET}" in
+  re10k)
+    require_absolute_path RE10K_TRAIN_DIR
+    require_absolute_path RE10K_TEST_DIR
+    ;;
+  objaverse)
+    require_absolute_path OBJV_DIR
+    ;;
+  co3d)
+    require_absolute_path CO3D_DIR
+    require_absolute_path CO3D_ANNOTATION_DIR
+    require_absolute_path CO3D_DEPTH_DIR
+    ;;
+  *)
+    echo "Unknown dataset: ${DATASET}" >&2
+    exit 2
+    ;;
+esac
+
+require_value CUDA_VISIBLE_DEVICES
+if [[ -z "${NGPUS:-}" ]]; then
+  IFS=',' read -r -a GPU_LIST <<< "${CUDA_VISIBLE_DEVICES}"
+  NGPUS=${#GPU_LIST[@]}
+fi
+if [[ "${NGPUS}" -lt 1 ]]; then
+  echo "NGPUS must be at least one." >&2
+  exit 2
+fi
+echo "Using ${NGPUS} GPUs: ${CUDA_VISIBLE_DEVICES}"
+
+require_absolute_path TORCHINDUCTOR_CACHE_DIR
+
 
 
 # Logs & Name
@@ -169,16 +224,19 @@ NAME="${NAME}-seed${SEED}"
 INPUT_DEPTH_STR=$([ "$INPUT_DEPTH" == "true" ] && echo "known_d" || echo "unknown_d")
 DATASET_STR=$([ "$DATASET" == "co3d" ] && echo "${DATASET}_${CATEGORY}" || echo "${DATASET}")
 
-LOG_DIR="${LOG_ROOT}/${MODEL_CONFIG}/${DATASET_STR}/${INPUT_DEPTH_STR}"
-PRINT_LOG_DIR="./logs/${MODEL_CONFIG}/${DATASET_STR}/${INPUT_DEPTH_STR}"
-[[ $BG_LOSS_W != 1.0 || $P_LOSS_W != 0.5 ]] && LOG_DIR="${LOG_DIR}/masked" && PRINT_LOG_DIR="${PRINT_LOG_DIR}/masked"
-
-LOG_DIR="${LOG_DIR}/${NAME}"
-
-# Override output dir if specified
-if [ -n "$OUTPUT_DIR_OVERRIDE" ]; then
-  LOG_DIR="$OUTPUT_DIR_OVERRIDE"
+if [[ -n "${OUTPUT_DIR_OVERRIDE:-}" ]]; then
+  require_absolute_path OUTPUT_DIR_OVERRIDE
+  LOG_DIR="${OUTPUT_DIR_OVERRIDE}"
+else
+  require_absolute_path WORKSPACE_ARTIFACT_DIR
+  LOG_DIR="${WORKSPACE_ARTIFACT_DIR}/${MODEL_CONFIG}/${DATASET_STR}/${INPUT_DEPTH_STR}"
+  [[ $BG_LOSS_W != 1.0 || $P_LOSS_W != 0.5 ]] && LOG_DIR="${LOG_DIR}/masked"
+  LOG_DIR="${LOG_DIR}/${NAME}"
 fi
+
+require_absolute_path WORKSPACE_LOG_DIR
+PRINT_LOG_DIR="${WORKSPACE_LOG_DIR}/${MODEL_CONFIG}/${DATASET_STR}/${INPUT_DEPTH_STR}"
+[[ $BG_LOSS_W != 1.0 || $P_LOSS_W != 0.5 ]] && PRINT_LOG_DIR="${PRINT_LOG_DIR}/masked"
 
 mkdir -p "${LOG_DIR}"
 mkdir -p "${PRINT_LOG_DIR}"
@@ -198,10 +256,10 @@ else
 fi
 
 # Command
-PYTHON_CMD=$([ "$PDB_MODE" = true ] && echo "python -m pdb" || echo "python")
+PYTHON_CMD=$([ "$PDB_MODE" = true ] && echo "${PYTHON_BIN} -m pdb" || echo "${PYTHON_BIN}")
 BASE_CMD=("NCCL_P2P_DISABLE=1 OMP_NUM_THREADS=1 ${PYTHON_CMD} -m torch.distributed.run --standalone --nnodes=1 --nproc-per-node=$NGPUS")
 BASE_CMD+=(
-  "nvs/trainval.py lvsm"
+  "${REPOSITORY_ROOT}/nvs/trainval.py lvsm"
   "--amp --amp_dtype fp16"
   "--dataset ${DATASET}"
   "--co3d_train_categories ${CATEGORY}"
@@ -245,12 +303,12 @@ elif [ -n "$TEST_CONTEXT_VIEWS" ]; then
     echo "Testing context ${cv}..."
     CMD=("${BASE_CMD[@]}" "--test_only --auto_resume" "--model_config.ref_views ${cv}" "--test_input_views ${cv}" "--test_subdir eval-context${cv}")
     if [ "$DATASET" == "co3d" ]; then
-      CMD+=("--co3d_test_seen_index_file assets/co3d_test_context${cv}_seen.json")
-      [[ "$TEST_UNSEEN" == "true" ]] && CMD+=("--co3d_test_unseen_index_file assets/co3d_test_context${cv}_unseen.json")
+      CMD+=("--co3d_test_seen_index_file ${REPOSITORY_ROOT}/assets/co3d_test_context${cv}_seen.json")
+      [[ "$TEST_UNSEEN" == "true" ]] && CMD+=("--co3d_test_unseen_index_file ${REPOSITORY_ROOT}/assets/co3d_test_context${cv}_unseen.json")
     elif [ "$DATASET" == "objaverse" ]; then
-      CMD+=("--objaverse_test_index_file assets/objaverse_index_test_context${cv}_all.json")
+      CMD+=("--objaverse_test_index_file ${REPOSITORY_ROOT}/assets/objaverse_index_test_context${cv}_all.json")
     elif [ "$DATASET" == "re10k" ]; then
-      CMD+=("--test_index_fp evaluation_index_re10k_context${cv}.json")
+      CMD+=("--test_index_fp ${REPOSITORY_ROOT}/evaluation_index_re10k_context${cv}.json")
     fi
 
     if [ "$TEST_RENDER_VIDEO" == "true" ]; then
