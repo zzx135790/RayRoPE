@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import importlib
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,84 @@ def test_objaverse_renderer_requires_an_explicit_log_file() -> None:
         for keyword in log_argument.keywords
     )
     assert all(keyword.arg != "default" for keyword in log_argument.keywords)
+
+
+def test_objaverse_submitit_task_passes_an_output_root_scoped_log(
+    monkeypatch, tmp_path: Path
+) -> None:
+    submitit_renderer = (
+        Path(__file__).resolve().parents[1] / "scripts/objv_submitit_batch_render.py"
+    )
+    tree = ast.parse(submitit_renderer.read_text(encoding="utf-8"))
+    render_task = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_render_task"
+    )
+
+    output_root = tmp_path / "explicit-output"
+    unrelated_cwd = tmp_path / "unrelated-cwd"
+    unrelated_cwd.mkdir()
+    monkeypatch.chdir(unrelated_cwd)
+
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        def wait(self) -> None:
+            return None
+
+    def popen(command, **kwargs):
+        assert kwargs == {"shell": False, "stdout": fake_subprocess.DEVNULL}
+        commands.append(command)
+        return FakeProcess()
+
+    fake_subprocess = types.SimpleNamespace(DEVNULL=object(), Popen=popen)
+    namespace = {
+        "CONFIG": {
+            "blender_script_path": "objv_render_vary_intrinsics.py",
+            "output_dir": str(output_root),
+            "blender_args": {
+                "num_views": "8",
+                "min_fov": "20.0",
+                "max_fov": "80.0",
+                "target_coverage": "0.6",
+                "seed": "1",
+                "resolution_x": "256",
+                "resolution_y": "256",
+                "engine": "BLENDER_EEVEE",
+                "save_mask": False,
+                "fix_radial": False,
+                "render_depth_only": False,
+                "render_depth": True,
+            },
+        },
+        "Path": Path,
+        "subprocess": fake_subprocess,
+    }
+    exec(
+        compile(
+            ast.Module(body=[render_task], type_ignores=[]),
+            str(submitit_renderer),
+            "exec",
+        ),
+        namespace,
+    )
+
+    namespace["_render_task"](["/assets/objects/chair.glb"])
+
+    command = commands.pop()
+    dump_log = Path(command[command.index("--dump_log") + 1])
+
+    assert dump_log.is_relative_to(output_root)
+    assert dump_log.parent.is_dir()
+    assert not tuple(unrelated_cwd.iterdir())
+
+    namespace["CONFIG"]["output_dir"] = ""
+
+    with pytest.raises(ValueError, match=r"CONFIG\['output_dir'\] must be set"):
+        namespace["_render_task"](["/assets/objects/chair.glb"])
+
+    assert not tuple(unrelated_cwd.iterdir())
 
 
 def test_re10k_selection_does_not_require_co3d_or_objaverse_environment(monkeypatch) -> None:

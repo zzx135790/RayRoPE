@@ -79,13 +79,24 @@ def _render_task(obj_paths):
         print("No object paths provided to render task", flush=True)
         return
 
+    output_dir = CONFIG["output_dir"]
+    if not output_dir:
+        raise ValueError("CONFIG['output_dir'] must be set")
+
+    output_root = Path(output_dir)
+    dump_log_directory = output_root / "logs"
+    dump_log_directory.mkdir(parents=True, exist_ok=True)
+    dump_log = dump_log_directory / f"{Path(obj_paths[0]).stem}.log"
+
     # @ VARY INTRINSICS RENDER
     command = [
         "python",
         CONFIG["blender_script_path"],
         "--",
         "--output_dir",
-        CONFIG["output_dir"],
+        output_dir,
+        "--dump_log",
+        str(dump_log),
         "--num_views",
         CONFIG["blender_args"]["num_views"],
         "--min_fov",
