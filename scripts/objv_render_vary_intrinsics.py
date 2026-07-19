@@ -2,12 +2,14 @@
 Exaample usage:
 
 python scripts/objv_render_vary_intrinsics.py -- \
-    --obj_path /grogu/datasets/objaverse/glbs/000-097/24a550a5d6e54402809a75eb8654230e.glb \
-    --output_dir ./test_blender \
+    --obj_path /path/to/object.glb \
+    --output_dir /path/to/rendered/views \
+    --dump_log /path/to/render.log
 
 python scripts/objv_render_vary_intrinsics.py -- \
-    --obj_path /grogu/datasets/objaverse/glbs/000-145/98bc91e1119d40b3b703de8ca975266c.glb \
-    --output_dir ./test_blender \
+    --obj_path /path/to/object.glb \
+    --output_dir /path/to/rendered/views \
+    --dump_log /path/to/render.log \
     --render_depth
 
 """
@@ -669,8 +671,8 @@ if __name__ == "__main__":
         help="Path to a .glb or .fbx file; repeat flag to process multiple objects.",
     )
     parser.add_argument("--background", type=str, default="white")
-    parser.add_argument("--output_dir", type=str, default="/grogu/user/yuwu3/objaverse80k_sp/data")
-    parser.add_argument("--dump_log", type=str, default="/home/yuwu3/VideoData/objaverse/dump.out")
+    parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--dump_log", type=str, required=True)
     parser.add_argument(
         "--engine", type=str, default="BLENDER_EEVEE", choices=["CYCLES", "BLENDER_EEVEE"]
     )
@@ -754,4 +756,3 @@ if __name__ == "__main__":
         f"Completed {len(args.obj_paths)} objects in {total_elapsed:.2f} seconds",
         flush=True,
     )
-        

@@ -1,10 +1,63 @@
 from __future__ import annotations
 
+import ast
 import importlib
 import sys
 from pathlib import Path
 
 import pytest
+
+
+def test_objaverse_renderer_has_no_machine_specific_grogu_paths() -> None:
+    renderer = Path(__file__).resolve().parents[1] / "scripts/objv_render_vary_intrinsics.py"
+
+    assert "/grogu/" not in renderer.read_text(encoding="utf-8")
+
+
+def test_objaverse_renderer_requires_an_explicit_output_directory() -> None:
+    renderer = Path(__file__).resolve().parents[1] / "scripts/objv_render_vary_intrinsics.py"
+    tree = ast.parse(renderer.read_text(encoding="utf-8"))
+    output_argument = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "--output_dir"
+    )
+
+    assert any(
+        keyword.arg == "required"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in output_argument.keywords
+    )
+    assert all(keyword.arg != "default" for keyword in output_argument.keywords)
+
+
+def test_objaverse_renderer_requires_an_explicit_log_file() -> None:
+    renderer = Path(__file__).resolve().parents[1] / "scripts/objv_render_vary_intrinsics.py"
+    tree = ast.parse(renderer.read_text(encoding="utf-8"))
+    log_argument = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "--dump_log"
+    )
+
+    assert any(
+        keyword.arg == "required"
+        and isinstance(keyword.value, ast.Constant)
+        and keyword.value.value is True
+        for keyword in log_argument.keywords
+    )
+    assert all(keyword.arg != "default" for keyword in log_argument.keywords)
 
 
 def test_re10k_selection_does_not_require_co3d_or_objaverse_environment(monkeypatch) -> None:
