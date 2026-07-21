@@ -1015,6 +1015,7 @@ class LVSMLauncher(Launcher):
                             "psnr": avg_psnr, "ssim": avg_ssim, "lpips": avg_lpips,
                         }, f)
 
+    @torch.inference_mode()
     def test_iteration(self, step: int, state: Dict[str, Any]) -> None:
         if self.config.pose_noise_enabled:
             return self.pose_noise_test_sweep(step, state)
