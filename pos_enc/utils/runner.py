@@ -461,6 +461,10 @@ class Launcher:
             if scheduler is not None:
                 scheduler.step()
 
+            # The final loss retains its autograd graph until the next iteration.
+            # Release it before an in-loop evaluation allocates a second forward.
+            del loss
+
             # Save checkpoint
             self.save_checkpoint(step, state)
 
