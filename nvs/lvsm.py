@@ -139,6 +139,9 @@ class LVSMDecoderOnlyModelConfig:
     recurrent_sigma_cap: Optional[float] = None
     # Timing configuration
     timing_enabled: bool = False
+    # Select the vendored default or the locked official PRoPE harness.
+    # Kept last to preserve all pre-existing positional config arguments.
+    prope_impl: Literal["vendored", "official"] = "vendored"
 
 
 class LVSMDecoderOnlyModel(nn.Module):
@@ -254,7 +257,18 @@ class LVSMDecoderOnlyModel(nn.Module):
                 image_height=config.img_shape[0],
             )
         else:
-            self.attention = PropeDotProductAttention(
+            attention_class = PropeDotProductAttention
+            if self.config.pos_enc == "prope":
+                if self.config.prope_impl not in ("vendored", "official"):
+                    raise ValueError(
+                        "prope_impl must be 'vendored' or 'official', got "
+                        f"{self.config.prope_impl!r}"
+                    )
+                if self.config.prope_impl == "official":
+                    from nvs.official_prope import load_official_prope_attention
+
+                    attention_class = load_official_prope_attention
+            self.attention = attention_class(
                 head_dim=config.encoder.layer.d_model // config.encoder.layer.nhead,
                 # cameras=config.ref_views + config.tar_views,
                 patches_x=config.img_shape[1] // config.patch_size,

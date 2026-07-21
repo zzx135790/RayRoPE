@@ -1,5 +1,6 @@
 import glob
 import itertools
+import json
 import os
 import random
 import time
@@ -91,6 +92,9 @@ class LauncherConfig:
     wandb_group: Optional[str] = None
     wandb_name: Optional[str] = None
     wandb_tags: str = ""  # comma-separated
+    wandb_id: Optional[str] = None
+    wandb_resume: Literal["never", "allow", "must", "auto"] = "never"
+    wandb_required: bool = False
 
 
 class Launcher:
@@ -145,24 +149,51 @@ class Launcher:
                         group=self.config.wandb_group,
                         tags=self.config.wandb_tags,
                         config=cfg_dict,
+                        run_id=self.config.wandb_id,
+                        resume=self.config.wandb_resume,
+                        required=self.config.wandb_required,
                     )
                     if logger.enabled:
                         self.writer = WandbWriter(logger, tb_writer=self.writer)
                         self._wandb_logger = logger
+                        receipt = {
+                            "schema_version": 1,
+                            "id": logger.run_id,
+                            "url": logger.run_url,
+                            "entity": logger.entity,
+                            "project": logger.project,
+                            "group": self.config.wandb_group,
+                            "name": self.config.wandb_name,
+                            "mode": self.config.wandb_mode,
+                            "resume": self.config.wandb_resume,
+                        }
+                        (Path(self.output_dir) / "wandb_run.json").write_text(
+                            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8",
+                        )
                         print(f"[wandb] run '{self.config.wandb_name}' "
                               f"group='{self.config.wandb_group}' "
-                              f"mode={self.config.wandb_mode}")
-                except Exception as error:  # noqa: BLE001 - never break training
+                              f"id='{logger.run_id}' mode={self.config.wandb_mode}")
+                except Exception as error:  # noqa: BLE001 - optional logging is best effort
+                    if self.config.wandb_required:
+                        self.writer.close()
+                        raise RuntimeError(
+                            f"required W&B setup failed before training: {error}"
+                        ) from error
                     print(f"[wandb] init failed ({error}); TB-only logging.")
             if not self.config.test_only:
                 (Path(self.output_dir) / "config.yaml").write_text(yaml.dump(config))
                 print(f"Wrote config to {self.output_dir}/config.yaml")
 
     def run(self):
-        if self.config.test_only:
-            self.test()
-        else:
-            self.train()
+        try:
+            if self.config.test_only:
+                self.test()
+            else:
+                self.train()
+        finally:
+            if self.world_rank == 0:
+                self.writer.close()
 
     # This function could be overriden to customize the behavior.
     def train_initialize(self) -> Dict[str, Any]:
