@@ -91,6 +91,7 @@ class LauncherConfig:
     wandb_group: Optional[str] = None
     wandb_name: Optional[str] = None
     wandb_tags: str = ""  # comma-separated
+    wandb_required: bool = False
 
 
 class Launcher:
@@ -100,6 +101,11 @@ class Launcher:
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.world_rank = int(os.environ.get("RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        if self.config.wandb_required and (
+            not self.config.wandb_enabled or self.config.wandb_mode != "online"
+        ):
+            raise ValueError("required W&B logging must be enabled in online mode")
 
         self.device = torch.device(f"cuda:{self.local_rank}")
 
@@ -125,7 +131,7 @@ class Launcher:
             if self.config.wandb_enabled:
                 # Mirror add_scalar/add_histogram to wandb via a SummaryWriter-
                 # compatible adapter (tokenmap.experiments.flag_rope.wandb_logging).
-                # Failure is non-fatal: falls back to a no-op logger (TB only).
+                # Optional runs fall back to TB; required runs fail before training.
                 try:
                     from tokenmap.experiments.flag_rope.wandb_logging import (
                         WandbWriter,
@@ -145,6 +151,7 @@ class Launcher:
                         group=self.config.wandb_group,
                         tags=self.config.wandb_tags,
                         config=cfg_dict,
+                        required=self.config.wandb_required,
                     )
                     if logger.enabled:
                         self.writer = WandbWriter(logger, tb_writer=self.writer)
@@ -152,7 +159,11 @@ class Launcher:
                         print(f"[wandb] run '{self.config.wandb_name}' "
                               f"group='{self.config.wandb_group}' "
                               f"mode={self.config.wandb_mode}")
-                except Exception as error:  # noqa: BLE001 - never break training
+                except Exception as error:
+                    if self.config.wandb_required:
+                        raise RuntimeError(
+                            "required W&B run failed to initialise"
+                        ) from error
                     print(f"[wandb] init failed ({error}); TB-only logging.")
             if not self.config.test_only:
                 (Path(self.output_dir) / "config.yaml").write_text(yaml.dump(config))

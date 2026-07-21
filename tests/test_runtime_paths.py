@@ -212,3 +212,17 @@ def test_default_co3d_evaluation_index_is_module_absolute_when_cwd_changes(
     )
     assert Path(config.co3d_test_seen_index_file) == expected
     assert Path(config.co3d_test_seen_index_file).is_absolute()
+
+
+def test_required_wandb_rejects_non_online_launcher_configuration(tmp_path) -> None:
+    from pos_enc.utils.runner import Launcher, LauncherConfig
+
+    config = LauncherConfig(
+        output_dir=str(tmp_path / "output"),
+        wandb_enabled=True,
+        wandb_mode="offline",
+        wandb_required=True,
+    )
+
+    with pytest.raises(ValueError, match="enabled in online mode"):
+        Launcher(config)
