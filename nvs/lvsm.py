@@ -76,6 +76,9 @@ class LVSMDecoderOnlyModelConfig:
     depth_type: str = "none"
     init_d: float = 0.0
     init_sig: float = 3.0
+    geometry_mode: Literal["dual", "ray_only", "segment"] = "dual"
+    depth_phase_mode: Literal["mean", "uniform_sinc"] = "uniform_sinc"
+    segment_pair_allocation: Tuple[int, int, int, int] = (6, 6, 6, 6)
     
     denc_type: str = "d"  # "d" or "inv_d" or "asinh_d"
     depth_input: bool = False # concat context depth map to ref input
@@ -215,17 +218,30 @@ class LVSMDecoderOnlyModel(nn.Module):
             )
             nhead = config.encoder.layer.nhead
             d_model = config.encoder.layer.d_model
-            n_geo = nhead  # content=0 → all heads ray/point
-            # Default split: ray=ceil, point=floor. Allow override for ablation
-            # (e.g. num_point_heads=0 → pure ray-head encoder).
-            num_ray = config.num_ray_heads if config.num_ray_heads is not None else (n_geo + 1) // 2
-            num_point = config.num_point_heads if config.num_point_heads is not None else n_geo // 2
+            n_geo = nhead  # content=0 → all heads are geometric
+            head_kwargs = {}
+            if config.geometry_mode == "dual":
+                # Preserve the existing ray/point override surface for dual
+                # baselines and historical pure-ray ablations.
+                head_kwargs = {
+                    "num_content_heads": 0,
+                    "num_ray_heads": (
+                        config.num_ray_heads
+                        if config.num_ray_heads is not None
+                        else (n_geo + 1) // 2
+                    ),
+                    "num_point_heads": (
+                        config.num_point_heads
+                        if config.num_point_heads is not None
+                        else n_geo // 2
+                    ),
+                }
             flag_cfg = FlagRoPEConfig.from_d_model_and_num_heads(
                 d_model=d_model,
                 num_heads=nhead,
-                num_content_heads=0,
-                num_ray_heads=num_ray,
-                num_point_heads=num_point,
+                geometry_mode=self.config.geometry_mode,
+                depth_phase_mode=self.config.depth_phase_mode,
+                segment_pair_allocation=self.config.segment_pair_allocation,
                 use_uncertainty_perturbation=False,
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,
@@ -245,6 +261,7 @@ class LVSMDecoderOnlyModel(nn.Module):
                 recurrent_sigma_cap=self.config.recurrent_sigma_cap,
                 recurrent_init_depth=self.config.init_d,
                 recurrent_init_sigma=self.config.init_sig,
+                **head_kwargs,
             )
             self.attention = FlagRoPEMultiQuerySdpaAttention(
                 config=flag_cfg,

@@ -21,6 +21,7 @@ from nvs.re10k_dataset import RE10K_TrainDataset, RE10K_EvalDataset, _normalize_
 from nvs.objaverse_dataset import ObjaverseTrainDataset, ObjaverseEvalDataset
 from nvs.co3d_dataset import Co3dTrainDataset, Co3dEvalDataset
 from nvs.runtime_paths import dataset_paths_for
+from nvs.metric_records import build_metrics_payload, build_scene_metric_record
 from nvs.lvsm import (
     Camera,
     LVSMDecoderOnlyModel,
@@ -157,6 +158,9 @@ class LVSMLauncherConfig(LauncherConfig):
     # is told the σ; RayRoPE / flag_rope-blind are not. See plan
     # robust-strolling-treehouse.md.
     pose_noise_enabled: bool = False
+    # Evaluate clean-trained models under blind pose noise after the clean test.
+    # Unlike pose_noise_enabled, this never changes training inputs.
+    pose_noise_diagnostic_only: bool = False
     pose_noise_rot_train_lo: float = 0.0
     pose_noise_rot_train_hi: float = 0.05
     pose_noise_trans_train_lo: float = 0.0
@@ -961,6 +965,16 @@ class LVSMLauncher(Launcher):
                             "psnr": avg_psnr, "ssim": avg_ssim, "lpips": avg_lpips,
                         }, f)
 
+    def run_pose_noise_diagnostic(self, step: int, state: Dict[str, Any]) -> None:
+        """Run the optional blind sweep without changing clean training semantics."""
+        if not self.config.pose_noise_diagnostic_only:
+            return
+        if self.config.pose_noise_enabled:
+            raise ValueError(
+                "pose_noise_diagnostic_only requires clean training inputs"
+            )
+        self.pose_noise_test_sweep(step, state)
+
     def test_iteration(self, step: int, state: Dict[str, Any]) -> None:
         if self.config.pose_noise_enabled:
             return self.pose_noise_test_sweep(step, state)
@@ -974,6 +988,7 @@ class LVSMLauncher(Launcher):
 
         for label, (input_views, dataloader) in dataloaders.items():
             psnrs, lpips, ssims = [], [], []
+            per_scene_records = []
             canvas = []  # for visualization
             for idx, data in enumerate(dataloader):
                 processed = self.preprocess(data, input_views=input_views)
@@ -1066,9 +1081,20 @@ class LVSMLauncher(Launcher):
                     # metrics.
                     outputs = rearrange(outputs, "b v h w c -> (b v) c h w")
                     tar_imgs = rearrange(tar_imgs, "b v h w c -> (b v) c h w")
-                    psnrs.append(state["psnr_fn"](outputs, tar_imgs))
-                    ssims.append(state["ssim_fn"](outputs, tar_imgs))
-                    lpips.append(state["lpips_fn"](outputs, tar_imgs))
+                    scene_psnr = state["psnr_fn"](outputs, tar_imgs)
+                    scene_ssim = state["ssim_fn"](outputs, tar_imgs)
+                    scene_lpips = state["lpips_fn"](outputs, tar_imgs)
+                    psnrs.append(scene_psnr)
+                    ssims.append(scene_ssim)
+                    lpips.append(scene_lpips)
+                    per_scene_records.append(
+                        build_scene_metric_record(
+                            tar_paths,
+                            psnr=scene_psnr,
+                            ssim=scene_ssim,
+                            lpips=scene_lpips,
+                        )
+                    )
 
             if self.config.render_video or self.config.render_view:
                 return
@@ -1108,6 +1134,17 @@ class LVSMLauncher(Launcher):
             avg_psnr, n_total = distributed_avg(psnrs, "psnr")
             avg_lpips, n_total = distributed_avg(lpips, "lpips")
             avg_ssim, n_total = distributed_avg(ssims, "ssim")
+            records_by_rank = [None] * self.world_size
+            torch.distributed.all_gather_object(records_by_rank, per_scene_records)
+            metrics_payload = build_metrics_payload(
+                label=label,
+                step=step,
+                n_total=n_total,
+                psnr=avg_psnr,
+                ssim=avg_ssim,
+                lpips=avg_lpips,
+                records_by_rank=records_by_rank,
+            )
 
             # Get timing stats for testing (only for rank 0)
             timing_info = ""
@@ -1137,17 +1174,7 @@ class LVSMLauncher(Launcher):
                         self.writer.add_scalar(f"test_timing/{key}_ms", value * 1000, step)
                 
                 with open(f"{self.test_dir}/metrics.json", "w") as f:
-                    json.dump(
-                        {
-                            "label": label,
-                            "step": step,
-                            "n_total": n_total,
-                            "psnr": avg_psnr,
-                            "ssim": avg_ssim,
-                            "lpips": avg_lpips,
-                        },
-                        f,
-                    )
+                    json.dump(metrics_payload, f)
 
             # save the predicted d analysis
             stat_predict_d = False
@@ -1174,6 +1201,8 @@ class LVSMLauncher(Launcher):
 
 
         
+        self.run_pose_noise_diagnostic(step, state)
+
         # Clear timing stats after test iteration
         if timing_enabled:
             get_timing_stats().clear()
