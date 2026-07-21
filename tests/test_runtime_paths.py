@@ -265,3 +265,37 @@ def test_target_view_chunking_preserves_order_and_bounds_model_calls() -> None:
 
     assert calls == [1, 1, 1]
     assert outputs.flatten().tolist() == [1.0, 2.0, 3.0]
+
+
+def test_nvs_evaluation_runs_in_inference_mode() -> None:
+    import torch
+
+    from nvs.trainval import LVSMLauncher
+
+    launcher = object.__new__(LVSMLauncher)
+    launcher.config = types.SimpleNamespace(
+        pose_noise_enabled=False,
+        render_video=True,
+        render_view=False,
+    )
+    launcher.world_rank = 0
+    observed = []
+
+    class Model:
+        def eval(self) -> None:
+            return None
+
+    class EmptyLoader:
+        def __iter__(self):
+            observed.append(torch.is_inference_mode_enabled())
+            return iter(())
+
+    launcher.test_iteration(
+        0,
+        {
+            "model": Model(),
+            "dataloaders": {"4": (4, EmptyLoader())},
+        },
+    )
+
+    assert observed == [True]
