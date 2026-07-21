@@ -29,7 +29,7 @@ OFFICIAL_PROPE_WORKTREE = (
     WORKSPACE_ROOT / "worktrees/baselines/prope/workspace"
 ).resolve()
 LOCKED_PROPE_COMMIT = "48b6dd26f1c7e906765379e4a0ef60cc50ddff7c"
-ACTIVE_PROPE_COMMIT = "061030aed768f0a70dbf8b6d9a117d674ed9e9a9"
+ACTIVE_PROPE_COMMIT = "47163c4428c320b24db80f26d1e6faaae7ea7b50"
 WORKSPACE_INTEGRATION_AVAILABLE = all(
     (
         (WORKSPACE_ROOT / "workspace.toml").is_file(),
