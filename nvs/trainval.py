@@ -138,6 +138,7 @@ class LVSMLauncherConfig(LauncherConfig):
     test_n: Optional[int] = None
     test_input_views: int = 2
     test_supervise_views: int = 3
+    test_target_view_chunk_size: Optional[int] = None
     test_zoom_factor: tuple[float, ...] = (1.0,)
     test_random_zoom: bool = False
     test_rad_sph: bool = False
@@ -244,6 +245,54 @@ class LVSMLauncher(Launcher):
         px = cfg.img_shape[1] // cfg.patch_size
         py = cfg.img_shape[0] // cfg.patch_size
         return px * py
+
+    def _forward_test_target_views(
+        self,
+        model: torch.nn.Module,
+        ref_imgs: Tensor,
+        ref_cams: Camera,
+        tar_cams: Camera,
+        *,
+        context_depths: Optional[Tensor] = None,
+        pose_sigma_overrides: Optional[dict] = None,
+        timing_enabled: bool = False,
+    ) -> Tensor:
+        """Evaluate independent target views in bounded-memory chunks."""
+
+        chunk_size = self.config.test_target_view_chunk_size
+        target_views = tar_cams.camtoworld.shape[1]
+        if chunk_size is None or chunk_size >= target_views:
+            return model(
+                ref_imgs,
+                ref_cams,
+                tar_cams,
+                context_depths=context_depths,
+                pose_sigma_overrides=pose_sigma_overrides,
+                timing_enabled=timing_enabled,
+            )
+        if chunk_size <= 0:
+            raise ValueError("test_target_view_chunk_size must be positive")
+
+        outputs = []
+        for start in range(0, target_views, chunk_size):
+            stop = min(start + chunk_size, target_views)
+            chunk_cams = Camera(
+                K=tar_cams.K[:, start:stop],
+                camtoworld=tar_cams.camtoworld[:, start:stop],
+                width=tar_cams.width,
+                height=tar_cams.height,
+            )
+            outputs.append(
+                model(
+                    ref_imgs,
+                    ref_cams,
+                    chunk_cams,
+                    context_depths=context_depths,
+                    pose_sigma_overrides=pose_sigma_overrides,
+                    timing_enabled=timing_enabled,
+                )
+            )
+        return torch.cat(outputs, dim=1)
 
     def _apply_pose_noise(
         self,
@@ -937,9 +986,14 @@ class LVSMLauncher(Launcher):
                                 pose_sigma_overrides, n, self._num_patches(),
                                 self.config.pose_noise_test_sigma_transform)
                     with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
-                        outputs = model(ref_imgs, ref_cams, tar_cams,
-                                        context_depths=context_depths,
-                                        pose_sigma_overrides=pose_sigma_overrides)
+                        outputs = self._forward_test_target_views(
+                            model,
+                            ref_imgs,
+                            ref_cams,
+                            tar_cams,
+                            context_depths=context_depths,
+                            pose_sigma_overrides=pose_sigma_overrides,
+                        )
                         outputs = torch.sigmoid(outputs)
                     outputs = rearrange(outputs, "b v h w c -> (b v) c h w")
                     tar_imgs = rearrange(tar_imgs, "b v h w c -> (b v) c h w")
@@ -1003,9 +1057,14 @@ class LVSMLauncher(Launcher):
                     "cuda", enabled=self.config.amp, dtype=self.amp_dtype
                 ):
                     with time_block("test_forward", timing_enabled):
-                        outputs = model(ref_imgs, ref_cams, tar_cams, 
-                                        context_depths=context_depths,
-                                        timing_enabled=timing_enabled)
+                        outputs = self._forward_test_target_views(
+                            model,
+                            ref_imgs,
+                            ref_cams,
+                            tar_cams,
+                            context_depths=context_depths,
+                            timing_enabled=timing_enabled,
+                        )
                         outputs = torch.sigmoid(outputs)
 
                 if self.config.render_video:
