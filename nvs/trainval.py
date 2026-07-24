@@ -21,6 +21,7 @@ from nvs.re10k_dataset import RE10K_TrainDataset, RE10K_EvalDataset, _normalize_
 from nvs.objaverse_dataset import ObjaverseTrainDataset, ObjaverseEvalDataset
 from nvs.co3d_dataset import Co3dTrainDataset, Co3dEvalDataset
 from nvs.runtime_paths import dataset_paths_for
+from nvs.metric_records import build_metrics_payload, build_scene_metric_record
 from nvs.lvsm import (
     Camera,
     LVSMDecoderOnlyModel,
@@ -43,6 +44,44 @@ _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
 
 def _repository_path(relative_path: str) -> str:
     return str(_REPOSITORY_ROOT / relative_path)
+
+
+def _model_uses_pose_sigma(model_config: object) -> bool:
+    return bool(
+        getattr(model_config, "use_pose_uncertainty", False)
+        or getattr(model_config, "use_pose_uncertainty_cf", False)
+    )
+
+
+def _re10k_train_scenes(
+    train_root: str, manifest_path: Optional[str] = None
+) -> List[str]:
+    """Resolve the exact RE10K training scene set, optionally from a manifest."""
+
+    available = {
+        path.name: str(path)
+        for path in Path(train_root).iterdir()
+        if path.is_dir() and (path / "transforms.json").is_file()
+    }
+    if manifest_path is None:
+        return [available[name] for name in sorted(available)]
+    manifest = Path(manifest_path)
+    if not manifest.is_absolute():
+        raise ValueError("re10k_train_scene_manifest must be absolute")
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 1:
+        raise ValueError("RE10K train scene manifest schema_version must equal 1")
+    names = payload.get("train_scenes")
+    if not isinstance(names, list) or not names or any(
+        not isinstance(name, str) for name in names
+    ):
+        raise ValueError("RE10K train scene manifest requires non-empty train_scenes")
+    if len(names) != len(set(names)):
+        raise ValueError("RE10K train scene manifest contains duplicate scenes")
+    missing = sorted(set(names) - set(available))
+    if missing:
+        raise ValueError(f"RE10K train scene manifest scenes are unavailable: {missing}")
+    return [available[name] for name in names]
 
 
 def write_tensor_to_image(
@@ -88,6 +127,9 @@ class LVSMLauncherConfig(LauncherConfig):
     dataset_supervise_views: int = 6
     dataset_input_views: int = 2  # ref (context) views; 4 for pose-robustness experiment
     dataset_batch_scenes: int = 4
+    # Closed development split controls. Both paths must be absolute when set.
+    re10k_train_scene_manifest: Optional[str] = None
+    re10k_eval_root: Optional[str] = None
     train_zoom_factor: float = 1.0
     train_random_zoom: bool = False
     
@@ -137,6 +179,7 @@ class LVSMLauncherConfig(LauncherConfig):
     test_n: Optional[int] = None
     test_input_views: int = 2
     test_supervise_views: int = 3
+    test_target_view_chunk_size: Optional[int] = None
     test_zoom_factor: tuple[float, ...] = (1.0,)
     test_random_zoom: bool = False
     test_rad_sph: bool = False
@@ -157,6 +200,9 @@ class LVSMLauncherConfig(LauncherConfig):
     # is told the σ; RayRoPE / flag_rope-blind are not. See plan
     # robust-strolling-treehouse.md.
     pose_noise_enabled: bool = False
+    # Evaluate clean-trained models under blind pose noise after the clean test.
+    # Unlike pose_noise_enabled, this never changes training inputs.
+    pose_noise_diagnostic_only: bool = False
     pose_noise_rot_train_lo: float = 0.0
     pose_noise_rot_train_hi: float = 0.05
     pose_noise_trans_train_lo: float = 0.0
@@ -240,6 +286,54 @@ class LVSMLauncher(Launcher):
         px = cfg.img_shape[1] // cfg.patch_size
         py = cfg.img_shape[0] // cfg.patch_size
         return px * py
+
+    def _forward_test_target_views(
+        self,
+        model: torch.nn.Module,
+        ref_imgs: Tensor,
+        ref_cams: Camera,
+        tar_cams: Camera,
+        *,
+        context_depths: Optional[Tensor] = None,
+        pose_sigma_overrides: Optional[dict] = None,
+        timing_enabled: bool = False,
+    ) -> Tensor:
+        """Evaluate independent target views in bounded-memory chunks."""
+
+        chunk_size = self.config.test_target_view_chunk_size
+        target_views = tar_cams.camtoworld.shape[1]
+        if chunk_size is None or chunk_size >= target_views:
+            return model(
+                ref_imgs,
+                ref_cams,
+                tar_cams,
+                context_depths=context_depths,
+                pose_sigma_overrides=pose_sigma_overrides,
+                timing_enabled=timing_enabled,
+            )
+        if chunk_size <= 0:
+            raise ValueError("test_target_view_chunk_size must be positive")
+
+        outputs = []
+        for start in range(0, target_views, chunk_size):
+            stop = min(start + chunk_size, target_views)
+            chunk_cams = Camera(
+                K=tar_cams.K[:, start:stop],
+                camtoworld=tar_cams.camtoworld[:, start:stop],
+                width=tar_cams.width,
+                height=tar_cams.height,
+            )
+            outputs.append(
+                model(
+                    ref_imgs,
+                    ref_cams,
+                    chunk_cams,
+                    context_depths=context_depths,
+                    pose_sigma_overrides=pose_sigma_overrides,
+                    timing_enabled=timing_enabled,
+                )
+            )
+        return torch.cat(outputs, dim=1)
 
     def _apply_pose_noise(
         self,
@@ -349,9 +443,8 @@ class LVSMLauncher(Launcher):
             # glob(*) would also pick up non-scene files (e.g. full_list.txt in
             # our re10k layout); keep only scene sub-directories that hold a
             # transforms.json. Data-layout adaptation only — no logic change.
-            scenes = sorted(
-                d for d in glob.glob(f"{paths.train}/*")
-                if os.path.isdir(d) and os.path.exists(os.path.join(d, "transforms.json"))
+            scenes = _re10k_train_scenes(
+                paths.train, self.config.re10k_train_scene_manifest
             )
             dataset = RE10K_TrainDataset(
                 scenes,
@@ -526,7 +619,7 @@ class LVSMLauncher(Launcher):
                 if mc.pose_sigma_init == "true":
                     pose_sigma_seed = pose_sigma_overrides
                 pose_sigma_overrides = None
-            elif not mc.use_pose_uncertainty:
+            elif not _model_uses_pose_sigma(mc):
                 pose_sigma_overrides = None  # blind / RayRoPE: don't tell the model
 
         # Enable timing only for rank 0 to avoid overhead
@@ -717,6 +810,9 @@ class LVSMLauncher(Launcher):
         
         if self.config.dataset == "re10k":
             paths = dataset_paths_for("re10k")
+            eval_root = self.config.re10k_eval_root or paths.test
+            if self.config.re10k_eval_root is not None and not os.path.isabs(eval_root):
+                raise ValueError("re10k_eval_root must be absolute")
             if not self.config.render_video and self.config.test_index_fp is None:
                 assert (
                     (self.config.test_input_views == 2
@@ -728,7 +824,7 @@ class LVSMLauncher(Launcher):
             
             for zoom_factor in self.config.test_zoom_factor:
                 dataset = RE10K_EvalDataset(
-                    folder=paths.test,
+                    folder=eval_root,
                     patch_size=self.config.dataset_patch_size,
                     zoom_factor=zoom_factor,
                     random_zoom=self.config.test_random_zoom,
@@ -926,16 +1022,21 @@ class LVSMLauncher(Launcher):
                             + int(round(rot_std * 1e6)) + idx)
                         ref_cams, pose_sigma_overrides = self._apply_pose_noise(
                             ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
-                        if not self.config.model_config.use_pose_uncertainty:
+                        if not _model_uses_pose_sigma(self.config.model_config):
                             pose_sigma_overrides = None
                         elif self.config.pose_noise_test_sigma_transform != "true":
                             pose_sigma_overrides = self._transform_test_sigma(
                                 pose_sigma_overrides, n, self._num_patches(),
                                 self.config.pose_noise_test_sigma_transform)
                     with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
-                        outputs = model(ref_imgs, ref_cams, tar_cams,
-                                        context_depths=context_depths,
-                                        pose_sigma_overrides=pose_sigma_overrides)
+                        outputs = self._forward_test_target_views(
+                            model,
+                            ref_imgs,
+                            ref_cams,
+                            tar_cams,
+                            context_depths=context_depths,
+                            pose_sigma_overrides=pose_sigma_overrides,
+                        )
                         outputs = torch.sigmoid(outputs)
                     outputs = rearrange(outputs, "b v h w c -> (b v) c h w")
                     tar_imgs = rearrange(tar_imgs, "b v h w c -> (b v) c h w")
@@ -961,6 +1062,17 @@ class LVSMLauncher(Launcher):
                             "psnr": avg_psnr, "ssim": avg_ssim, "lpips": avg_lpips,
                         }, f)
 
+    def run_pose_noise_diagnostic(self, step: int, state: Dict[str, Any]) -> None:
+        """Run the optional blind sweep without changing clean training semantics."""
+        if not self.config.pose_noise_diagnostic_only:
+            return
+        if self.config.pose_noise_enabled:
+            raise ValueError(
+                "pose_noise_diagnostic_only requires clean training inputs"
+            )
+        self.pose_noise_test_sweep(step, state)
+
+    @torch.inference_mode()
     def test_iteration(self, step: int, state: Dict[str, Any]) -> None:
         if self.config.pose_noise_enabled:
             return self.pose_noise_test_sweep(step, state)
@@ -974,6 +1086,7 @@ class LVSMLauncher(Launcher):
 
         for label, (input_views, dataloader) in dataloaders.items():
             psnrs, lpips, ssims = [], [], []
+            per_scene_records = []
             canvas = []  # for visualization
             for idx, data in enumerate(dataloader):
                 processed = self.preprocess(data, input_views=input_views)
@@ -988,9 +1101,14 @@ class LVSMLauncher(Launcher):
                     "cuda", enabled=self.config.amp, dtype=self.amp_dtype
                 ):
                     with time_block("test_forward", timing_enabled):
-                        outputs = model(ref_imgs, ref_cams, tar_cams, 
-                                        context_depths=context_depths,
-                                        timing_enabled=timing_enabled)
+                        outputs = self._forward_test_target_views(
+                            model,
+                            ref_imgs,
+                            ref_cams,
+                            tar_cams,
+                            context_depths=context_depths,
+                            timing_enabled=timing_enabled,
+                        )
                         outputs = torch.sigmoid(outputs)
 
                 if self.config.render_video:
@@ -1066,9 +1184,20 @@ class LVSMLauncher(Launcher):
                     # metrics.
                     outputs = rearrange(outputs, "b v h w c -> (b v) c h w")
                     tar_imgs = rearrange(tar_imgs, "b v h w c -> (b v) c h w")
-                    psnrs.append(state["psnr_fn"](outputs, tar_imgs))
-                    ssims.append(state["ssim_fn"](outputs, tar_imgs))
-                    lpips.append(state["lpips_fn"](outputs, tar_imgs))
+                    scene_psnr = state["psnr_fn"](outputs, tar_imgs)
+                    scene_ssim = state["ssim_fn"](outputs, tar_imgs)
+                    scene_lpips = state["lpips_fn"](outputs, tar_imgs)
+                    psnrs.append(scene_psnr)
+                    ssims.append(scene_ssim)
+                    lpips.append(scene_lpips)
+                    per_scene_records.append(
+                        build_scene_metric_record(
+                            tar_paths,
+                            psnr=scene_psnr,
+                            ssim=scene_ssim,
+                            lpips=scene_lpips,
+                        )
+                    )
 
             if self.config.render_video or self.config.render_view:
                 return
@@ -1108,6 +1237,17 @@ class LVSMLauncher(Launcher):
             avg_psnr, n_total = distributed_avg(psnrs, "psnr")
             avg_lpips, n_total = distributed_avg(lpips, "lpips")
             avg_ssim, n_total = distributed_avg(ssims, "ssim")
+            records_by_rank = [None] * self.world_size
+            torch.distributed.all_gather_object(records_by_rank, per_scene_records)
+            metrics_payload = build_metrics_payload(
+                label=label,
+                step=step,
+                n_total=n_total,
+                psnr=avg_psnr,
+                ssim=avg_ssim,
+                lpips=avg_lpips,
+                records_by_rank=records_by_rank,
+            )
 
             # Get timing stats for testing (only for rank 0)
             timing_info = ""
@@ -1137,17 +1277,7 @@ class LVSMLauncher(Launcher):
                         self.writer.add_scalar(f"test_timing/{key}_ms", value * 1000, step)
                 
                 with open(f"{self.test_dir}/metrics.json", "w") as f:
-                    json.dump(
-                        {
-                            "label": label,
-                            "step": step,
-                            "n_total": n_total,
-                            "psnr": avg_psnr,
-                            "ssim": avg_ssim,
-                            "lpips": avg_lpips,
-                        },
-                        f,
-                    )
+                    json.dump(metrics_payload, f)
 
             # save the predicted d analysis
             stat_predict_d = False
@@ -1174,6 +1304,8 @@ class LVSMLauncher(Launcher):
 
 
         
+        self.run_pose_noise_diagnostic(step, state)
+
         # Clear timing stats after test iteration
         if timing_enabled:
             get_timing_stats().clear()

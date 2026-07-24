@@ -212,3 +212,98 @@ def test_default_co3d_evaluation_index_is_module_absolute_when_cwd_changes(
     )
     assert Path(config.co3d_test_seen_index_file) == expected
     assert Path(config.co3d_test_seen_index_file).is_absolute()
+
+
+def test_required_wandb_rejects_non_online_launcher_configuration(tmp_path) -> None:
+    from pos_enc.utils.runner import Launcher, LauncherConfig
+
+    config = LauncherConfig(
+        output_dir=str(tmp_path / "output"),
+        wandb_enabled=True,
+        wandb_mode="offline",
+        wandb_required=True,
+    )
+
+    with pytest.raises(ValueError, match="enabled in online mode"):
+        Launcher(config)
+
+
+def test_launcher_config_exposes_stable_wandb_resume_identity() -> None:
+    from pos_enc.utils.runner import LauncherConfig
+
+    config = LauncherConfig(wandb_id="stable-id", wandb_resume="must")
+    assert config.wandb_id == "stable-id"
+    assert config.wandb_resume == "must"
+
+
+def test_target_view_chunking_preserves_order_and_bounds_model_calls() -> None:
+    import torch
+
+    from nvs.trainval import LVSMLauncher
+    from pos_enc.utils.functional import Camera
+
+    launcher = object.__new__(LVSMLauncher)
+    launcher.config = types.SimpleNamespace(test_target_view_chunk_size=1)
+    calls = []
+
+    class Model:
+        def __call__(self, ref_imgs, ref_cams, tar_cams, **kwargs):
+            calls.append(tar_cams.camtoworld.shape[1])
+            values = tar_cams.K[:, :, 0, 0]
+            return values[:, :, None, None, None]
+
+    ref_cams = Camera(
+        K=torch.eye(3)[None, None],
+        camtoworld=torch.eye(4)[None, None],
+        width=1,
+        height=1,
+    )
+    target_K = torch.eye(3)[None, None].repeat(1, 3, 1, 1)
+    target_K[0, :, 0, 0] = torch.tensor([1.0, 2.0, 3.0])
+    tar_cams = Camera(
+        K=target_K,
+        camtoworld=torch.eye(4)[None, None].repeat(1, 3, 1, 1),
+        width=1,
+        height=1,
+    )
+
+    outputs = launcher._forward_test_target_views(
+        Model(), torch.zeros(1, 1, 1, 1, 3), ref_cams, tar_cams
+    )
+
+    assert calls == [1, 1, 1]
+    assert outputs.flatten().tolist() == [1.0, 2.0, 3.0]
+
+
+def test_nvs_evaluation_runs_in_inference_mode() -> None:
+    import torch
+
+    from nvs.trainval import LVSMLauncher
+
+    launcher = object.__new__(LVSMLauncher)
+    launcher.config = types.SimpleNamespace(
+        pose_noise_enabled=False,
+        render_video=True,
+        render_view=False,
+    )
+    launcher.world_rank = 0
+    observed = []
+
+    class Model:
+        def eval(self) -> None:
+            return None
+
+    class EmptyLoader:
+        def __iter__(self):
+            observed.append(torch.is_inference_mode_enabled())
+            return iter(())
+
+    launcher.test_iteration(
+        0,
+        {
+            "model": Model(),
+            "dataloaders": {"4": (4, EmptyLoader())},
+        },
+    )
+
+    assert observed == [True]

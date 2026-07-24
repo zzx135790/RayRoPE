@@ -105,6 +105,11 @@ class Launcher:
         self.world_rank = int(os.environ.get("RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
 
+        if self.config.wandb_required and (
+            not self.config.wandb_enabled or self.config.wandb_mode != "online"
+        ):
+            raise ValueError("required W&B logging must be enabled in online mode")
+
         self.device = torch.device(f"cuda:{self.local_rank}")
 
         # Setup output directories.
@@ -129,7 +134,7 @@ class Launcher:
             if self.config.wandb_enabled:
                 # Mirror add_scalar/add_histogram to wandb via a SummaryWriter-
                 # compatible adapter (tokenmap.experiments.flag_rope.wandb_logging).
-                # Failure is non-fatal: falls back to a no-op logger (TB only).
+                # Optional runs fall back to TB; required runs fail before training.
                 try:
                     from tokenmap.experiments.flag_rope.wandb_logging import (
                         WandbWriter,
@@ -480,6 +485,10 @@ class Launcher:
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
+
+            # The final loss retains its autograd graph until the next iteration.
+            # Release it before an in-loop evaluation allocates a second forward.
+            del loss
 
             # Save checkpoint
             self.save_checkpoint(step, state)
