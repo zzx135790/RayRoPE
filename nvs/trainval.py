@@ -1,4 +1,5 @@
 import glob
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -1002,12 +1003,16 @@ class LVSMLauncher(Launcher):
         for rot_std, trans_std, tag in levels:
             for label, (input_views, dataloader) in dataloaders.items():
                 psnrs, ssims, lpips = [], [], []
+                per_scene_records = []
+                corruption_records = []
                 for idx, data in enumerate(dataloader):
                     processed = self.preprocess(data, input_views=input_views)
                     ref_imgs, tar_imgs = processed["ref_imgs"], processed["tar_imgs"]
                     ref_cams, tar_cams = processed["ref_cams"], processed["tar_cams"]
+                    tar_paths = processed.get("tar_paths")
                     context_depths = processed.get("context_depths", None)
                     pose_sigma_overrides = None
+                    corruption_hash = hashlib.sha256()
                     if rot_std > 0.0:
                         V1 = ref_cams.camtoworld.shape[1]
                         B = ref_cams.camtoworld.shape[0]
@@ -1022,12 +1027,23 @@ class LVSMLauncher(Launcher):
                             + int(round(rot_std * 1e6)) + idx)
                         ref_cams, pose_sigma_overrides = self._apply_pose_noise(
                             ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
+                        corruption_hash.update(
+                            per_cam_rot.detach().cpu().numpy().tobytes()
+                        )
+                        corruption_hash.update(
+                            per_cam_trans.detach().cpu().numpy().tobytes()
+                        )
                         if not _model_uses_pose_sigma(self.config.model_config):
                             pose_sigma_overrides = None
                         elif self.config.pose_noise_test_sigma_transform != "true":
                             pose_sigma_overrides = self._transform_test_sigma(
                                 pose_sigma_overrides, n, self._num_patches(),
                                 self.config.pose_noise_test_sigma_transform)
+                    else:
+                        corruption_hash.update(b"clean")
+                    corruption_records.append(
+                        {"index": idx, "digest": corruption_hash.hexdigest()}
+                    )
                     with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
                         outputs = self._forward_test_target_views(
                             model,
@@ -1043,9 +1059,57 @@ class LVSMLauncher(Launcher):
                     psnrs.append(state["psnr_fn"](outputs, tar_imgs))
                     ssims.append(state["ssim_fn"](outputs, tar_imgs))
                     lpips.append(state["lpips_fn"](outputs, tar_imgs))
+                    if tar_paths is not None:
+                        per_scene_records.append(
+                            build_scene_metric_record(
+                                tar_paths,
+                                psnr=psnrs[-1],
+                                ssim=ssims[-1],
+                                lpips=lpips[-1],
+                            )
+                        )
                 avg_psnr, n_total = self._dist_avg(psnrs, "psnr", label)
                 avg_ssim, _ = self._dist_avg(ssims, "ssim", label)
                 avg_lpips, _ = self._dist_avg(lpips, "lpips", label)
+                records_by_rank = [None] * self.world_size
+                torch.distributed.all_gather_object(records_by_rank, per_scene_records)
+                merged_records = [
+                    record
+                    for rank_records in records_by_rank
+                    for record in (rank_records or [])
+                ]
+                digest_by_rank = [None] * self.world_size
+                torch.distributed.all_gather_object(digest_by_rank, corruption_records)
+                corruption_entries = sorted(
+                    (
+                        entry
+                        for rank_entries in digest_by_rank
+                        for entry in (rank_entries or [])
+                    ),
+                    key=lambda entry: int(entry["index"]),
+                )
+                corruption_digest = hashlib.sha256(
+                    json.dumps(corruption_entries, sort_keys=True).encode("utf-8")
+                ).hexdigest()
+                metrics_payload = {
+                    "label": label,
+                    "level_tag": tag,
+                    "rot_std": rot_std,
+                    "trans_std": trans_std,
+                    "step": step,
+                    "n_total": n_total,
+                    "psnr": avg_psnr,
+                    "ssim": avg_ssim,
+                    "lpips": avg_lpips,
+                    "sigma_transform": getattr(
+                        self.config, "pose_noise_test_sigma_transform", "true"
+                    ),
+                    "corruption_digest": corruption_digest,
+                }
+                if len(merged_records) == n_total:
+                    metrics_payload["per_scene"] = sorted(
+                        merged_records, key=lambda record: str(record["scene_id"])
+                    )
                 self.logging_on_master(
                     f"[pose-noise {tag}] PSNR{label}: {avg_psnr:.3f}, "
                     f"SSIM: {avg_ssim:.3f}, LPIPS: {avg_lpips:.3f} "
@@ -1055,12 +1119,7 @@ class LVSMLauncher(Launcher):
                     self.writer.add_scalar(f"test/ssim_{tag}", avg_ssim, step)
                     self.writer.add_scalar(f"test/lpips_{tag}", avg_lpips, step)
                     with open(f"{self.test_dir}/metrics_{tag}.json", "w") as f:
-                        json.dump({
-                            "label": label, "level_tag": tag,
-                            "rot_std": rot_std, "trans_std": trans_std,
-                            "step": step, "n_total": n_total,
-                            "psnr": avg_psnr, "ssim": avg_ssim, "lpips": avg_lpips,
-                        }, f)
+                        json.dump(metrics_payload, f)
 
     def run_pose_noise_diagnostic(self, step: int, state: Dict[str, Any]) -> None:
         """Run the optional blind sweep without changing clean training semantics."""
