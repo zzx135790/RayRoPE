@@ -2,7 +2,9 @@
 
 from types import SimpleNamespace
 
-from nvs.trainval import LVSMLauncher, _model_uses_pose_sigma
+import torch
+
+from nvs.trainval import LVSMLauncher, _camera_input_digest, _model_uses_pose_sigma
 
 
 def test_blind_pose_noise_diagnostic_is_separate_from_noisy_training():
@@ -41,3 +43,13 @@ def test_pose_sigma_routing_includes_stochastic_and_cf_modes():
     assert not _model_uses_pose_sigma(
         SimpleNamespace(use_pose_uncertainty=False, use_pose_uncertainty_cf=False)
     )
+
+
+def test_corruption_digest_tracks_exact_camera_inputs():
+    first = SimpleNamespace(camtoworld=torch.eye(4).reshape(1, 1, 4, 4))
+    same = SimpleNamespace(camtoworld=first.camtoworld.clone())
+    changed = SimpleNamespace(camtoworld=first.camtoworld.clone())
+    changed.camtoworld[0, 0, 0, 3] = 0.01
+
+    assert _camera_input_digest(first) == _camera_input_digest(same)
+    assert _camera_input_digest(first) != _camera_input_digest(changed)

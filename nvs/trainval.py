@@ -34,10 +34,22 @@ from tokenmap.experiments.flag_rope.pose_noise import (
     pad_to_full_camera_sigma,
     sample_corrupt_subset,
 )
+
+
 from nvs.perceptual import Perceptual
 from pos_enc.utils.functional import random_SO3
 from pos_enc.utils.runner import Launcher, LauncherConfig, nested_to_device
 from pos_enc.timing_utils import time_block, get_timing_stats
+
+
+def _camera_input_digest(cameras) -> str:
+    """Hash the exact camera extrinsics presented to the model."""
+    camtoworld = cameras.camtoworld.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tuple(camtoworld.shape)).encode("ascii"))
+    digest.update(str(camtoworld.dtype).encode("ascii"))
+    digest.update(camtoworld.numpy().tobytes())
+    return digest.hexdigest()
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
@@ -1012,7 +1024,6 @@ class LVSMLauncher(Launcher):
                     tar_paths = processed.get("tar_paths")
                     context_depths = processed.get("context_depths", None)
                     pose_sigma_overrides = None
-                    corruption_hash = hashlib.sha256()
                     if rot_std > 0.0:
                         V1 = ref_cams.camtoworld.shape[1]
                         B = ref_cams.camtoworld.shape[0]
@@ -1027,22 +1038,18 @@ class LVSMLauncher(Launcher):
                             + int(round(rot_std * 1e6)) + idx)
                         ref_cams, pose_sigma_overrides = self._apply_pose_noise(
                             ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
-                        corruption_hash.update(
-                            per_cam_rot.detach().cpu().numpy().tobytes()
-                        )
-                        corruption_hash.update(
-                            per_cam_trans.detach().cpu().numpy().tobytes()
-                        )
                         if not _model_uses_pose_sigma(self.config.model_config):
                             pose_sigma_overrides = None
                         elif self.config.pose_noise_test_sigma_transform != "true":
                             pose_sigma_overrides = self._transform_test_sigma(
                                 pose_sigma_overrides, n, self._num_patches(),
                                 self.config.pose_noise_test_sigma_transform)
-                    else:
-                        corruption_hash.update(b"clean")
                     corruption_records.append(
-                        {"index": idx, "digest": corruption_hash.hexdigest()}
+                        {
+                            "rank": self.world_rank,
+                            "index": idx,
+                            "digest": _camera_input_digest(ref_cams),
+                        }
                     )
                     with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
                         outputs = self._forward_test_target_views(
@@ -1086,7 +1093,7 @@ class LVSMLauncher(Launcher):
                         for rank_entries in digest_by_rank
                         for entry in (rank_entries or [])
                     ),
-                    key=lambda entry: int(entry["index"]),
+                    key=lambda entry: (int(entry["rank"]), int(entry["index"])),
                 )
                 corruption_digest = hashlib.sha256(
                     json.dumps(corruption_entries, sort_keys=True).encode("utf-8")
@@ -1104,6 +1111,7 @@ class LVSMLauncher(Launcher):
                     "sigma_transform": getattr(
                         self.config, "pose_noise_test_sigma_transform", "true"
                     ),
+                    "corruption_digest_kind": "post_noise_camtoworld_sha256_v1",
                     "corruption_digest": corruption_digest,
                 }
                 if len(merged_records) == n_total:
