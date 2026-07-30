@@ -18,6 +18,32 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
 
+TRAINING_RUNTIME_BOUNDARY = (
+    "before_first_training_iteration_to_after_final_optimizer_update"
+)
+
+
+def build_training_runtime_payload(
+    *, first_step: int, last_step: int, wall_seconds: float
+) -> dict[str, object]:
+    if first_step < 0 or last_step < first_step:
+        raise ValueError("last_step must be greater than or equal to first_step")
+    if not np.isfinite(wall_seconds) or wall_seconds <= 0.0:
+        raise ValueError("wall_seconds must be positive and finite")
+    updates = last_step - first_step + 1
+    return {
+        "schema_version": 1,
+        "kind": "training-update-runtime",
+        "first_step": first_step,
+        "last_step": last_step,
+        "training_updates": updates,
+        "training_wall_seconds": wall_seconds,
+        "training_seconds_per_update": wall_seconds / updates,
+        "timing_boundary": TRAINING_RUNTIME_BOUNDARY,
+        "cuda_synchronized_at_boundaries": True,
+    }
+
+
 def set_random_seed(seed):
     print(f"Setting random seed to {seed}", flush=True)
     random.seed(seed)
@@ -199,6 +225,27 @@ class Launcher:
         finally:
             if self.world_rank == 0:
                 self.writer.close()
+
+    def _start_training_runtime(self) -> None:
+        torch.cuda.synchronize(self.device)
+        self._training_runtime_started_at = time.perf_counter()
+
+    def _finish_training_runtime(self, *, first_step: int, last_step: int) -> None:
+        torch.cuda.synchronize(self.device)
+        started = getattr(self, "_training_runtime_started_at", None)
+        if not isinstance(started, float):
+            raise RuntimeError("training runtime timer was not started")
+        payload = build_training_runtime_payload(
+            first_step=first_step,
+            last_step=last_step,
+            wall_seconds=time.perf_counter() - started,
+        )
+        if self.world_rank == 0:
+            path = Path(self.output_dir) / "training_runtime.json"
+            path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
 
     # This function could be overriden to customize the behavior.
     def train_initialize(self) -> Dict[str, Any]:
@@ -423,6 +470,7 @@ class Launcher:
             grad_scaler = torch.amp.GradScaler(device="cuda")
 
         # Training loop.
+        self._start_training_runtime()
         for step in range(init_step, self.config.max_steps + 1):
             for acc_step in range(self.config.acc):
                 # Train iteration.
@@ -485,6 +533,8 @@ class Launcher:
             optimizer.zero_grad()
             if scheduler is not None:
                 scheduler.step()
+            if step == self.config.max_steps:
+                self._finish_training_runtime(first_step=init_step, last_step=step)
 
             # The final loss retains its autograd graph until the next iteration.
             # Release it before an in-loop evaluation allocates a second forward.
