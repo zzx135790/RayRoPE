@@ -151,6 +151,8 @@ class LVSMDecoderOnlyModelConfig:
     uncertainty_strategy: Optional[
         Literal["none", "linearized_shared_sample", "nonlinear_shared_sample"]
     ] = None
+    # Execution-only bound for vectorized nonlinear owner samples.
+    nonlinear_sample_chunk_size: int = 16
     
     denc_type: str = "d"  # "d" or "inv_d" or "asinh_d"
     depth_input: bool = False # concat context depth map to ref input
@@ -325,6 +327,7 @@ class LVSMDecoderOnlyModel(nn.Module):
                 segment_source_target=self.config.segment_endpoint_bounds,
                 rope_family=self.config.rope_family,
                 uncertainty_strategy=self.config.uncertainty_strategy,
+                nonlinear_sample_chunk_size=self.config.nonlinear_sample_chunk_size,
                 use_uncertainty_perturbation=False,
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,

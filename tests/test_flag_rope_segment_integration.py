@@ -119,6 +119,7 @@ def test_lvsm_threads_owner_shared_configuration_into_flag_rope():
     config.head_aware_frequency_layout = True
     config.rope_family = "ray_point"
     config.uncertainty_strategy = "linearized_shared_sample"
+    config.nonlinear_sample_chunk_size = 7
 
     model = LVSMDecoderOnlyModel(config)
 
@@ -127,6 +128,7 @@ def test_lvsm_threads_owner_shared_configuration_into_flag_rope():
         model.attention.config.uncertainty_strategy
         == "linearized_shared_sample"
     )
+    assert model.attention.config.nonlinear_sample_chunk_size == 7
 
 
 def test_lvsm_converts_token_expanded_pose_sigma_back_to_camera_owners():
