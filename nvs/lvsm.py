@@ -31,6 +31,68 @@ from pos_enc.utils.transformer import (
 )
 
 
+def _physical_uncertainty_from_pose_sigma(
+    sigma_overrides: dict,
+    *,
+    batch_size: int,
+    camera_count: int,
+    num_patches: int,
+):
+    """Convert legacy token-expanded pose sigma to camera-owned uncertainty."""
+
+    from tokenmap.models.scene.probabilistic_flag_rope.uncertainty_source import (
+        GaussianUncertainty,
+        PhysicalUncertainty,
+    )
+
+    expected_tokens = camera_count * num_patches
+    rot_token = sigma_overrides["pose_rot"]
+    trans_token = sigma_overrides["pose_trans"]
+    if rot_token.shape[-1] != expected_tokens:
+        raise ValueError("pose sigma token count does not match FlagRoPE geometry")
+    if rot_token.shape[0] != batch_size:
+        if batch_size % rot_token.shape[0] != 0:
+            raise ValueError("pose sigma batch cannot be expanded to LVSM target batch")
+        repeats = batch_size // rot_token.shape[0]
+        rot_token = rot_token.repeat_interleave(repeats, dim=0)
+        trans_token = trans_token.repeat_interleave(repeats, dim=0)
+    rot_camera = rot_token[:, 0, ::num_patches]
+    trans_camera = trans_token[:, 0, ::num_patches]
+    pose_scale = torch.cat(
+        (
+            rot_camera[..., None].expand(-1, -1, 3),
+            trans_camera[..., None].expand(-1, -1, 3),
+        ),
+        dim=-1,
+    )
+    return PhysicalUncertainty(
+        pose=GaussianUncertainty(scale=pose_scale, owner="camera")
+    )
+
+
+def _transform_depth_uncertainty(
+    predicted_d: torch.Tensor, transform: str, num_patches: int
+) -> torch.Tensor:
+    """Apply an eval-only width intervention while preserving log-depth centres."""
+
+    if transform == "true":
+        return predicted_d
+    if predicted_d.ndim != 3 or predicted_d.shape[-1] != 2:
+        raise ValueError("predicted depth must have shape [B,N,2]")
+    if transform not in ("zero", "permute_within_camera"):
+        raise ValueError("unsupported depth uncertainty transform")
+    result = predicted_d.clone()
+    if transform == "zero":
+        result[..., 1] = 0
+        return result
+    if result.shape[1] % num_patches:
+        raise ValueError("token count must be divisible by num_patches")
+    camera_count = result.shape[1] // num_patches
+    widths = result[..., 1].reshape(result.shape[0], camera_count, num_patches)
+    result[..., 1] = torch.roll(widths, shifts=1, dims=2).reshape(result.shape[0], -1)
+    return result
+
+
 @dataclass
 class LVSMDecoderOnlyModelConfig:
 
@@ -85,6 +147,10 @@ class LVSMDecoderOnlyModelConfig:
     frequency_axis_layout: Literal["tensor_product", "round_robin"] = "tensor_product"
     segment_head_allocation: Tuple[int, int, int, int] = (4, 4, 4, 4)
     segment_endpoint_bounds: bool = False
+    rope_family: Optional[Literal["ray", "ray_point", "segment_bounds"]] = None
+    uncertainty_strategy: Optional[
+        Literal["none", "linearized_shared_sample", "nonlinear_shared_sample"]
+    ] = None
     
     denc_type: str = "d"  # "d" or "inv_d" or "asinh_d"
     depth_input: bool = False # concat context depth map to ref input
@@ -256,7 +322,9 @@ class LVSMDecoderOnlyModel(nn.Module):
                 frequency_allocation=self.config.frequency_allocation,
                 frequency_axis_layout=self.config.frequency_axis_layout,
                 segment_head_allocation=self.config.segment_head_allocation,
-                segment_endpoint_bounds=self.config.segment_endpoint_bounds,
+                segment_source_target=self.config.segment_endpoint_bounds,
+                rope_family=self.config.rope_family,
+                uncertainty_strategy=self.config.uncertainty_strategy,
                 use_uncertainty_perturbation=False,
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,
@@ -415,6 +483,8 @@ class LVSMDecoderOnlyModel(nn.Module):
         timing_enabled: bool = False,
         pose_sigma_overrides: Optional[dict] = None,
         pose_sigma_seed: Optional[dict] = None,
+        uncertainty_sample_seed: Optional[int] = None,
+        depth_uncertainty_transform: str = "true",
     ) -> Tensor:
 
         with time_block("preprocess", enabled=timing_enabled):
@@ -485,14 +555,49 @@ class LVSMDecoderOnlyModel(nn.Module):
                 # Other pos_enc (RayRoPE) _precompute_and_cache_apply_fns don't
                 # accept sigma_overrides.
                 if self.config.pos_enc == "flag_rope":
-                    if self.config.use_recurrent_uncertainty:
+                    shared_strategy = self.config.uncertainty_strategy in (
+                        "linearized_shared_sample",
+                        "nonlinear_shared_sample",
+                    )
+                    if shared_strategy and pose_sigma_overrides is not None:
+                        _pc_kwargs["uncertainty"] = (
+                            _physical_uncertainty_from_pose_sigma(
+                                pose_sigma_overrides,
+                                batch_size=viewmats.shape[0],
+                                camera_count=viewmats.shape[1],
+                                num_patches=self.attention.num_patches,
+                            )
+                        )
+                    elif self.config.use_recurrent_uncertainty:
                         if pose_sigma_seed is not None:
                             _pc_kwargs["sigma_overrides"] = pose_sigma_seed
                     elif pose_sigma_overrides is not None:
                         _pc_kwargs["sigma_overrides"] = pose_sigma_overrides
                 self.attention._precompute_and_cache_apply_fns(**_pc_kwargs)
 
+        attention_call_index = 0
+
         def sdpa_fn(q, k, v, **sdpa_kwargs):
+            nonlocal attention_call_index
+            shared_strategy = config.uncertainty_strategy in (
+                "linearized_shared_sample",
+                "nonlinear_shared_sample",
+            )
+            if shared_strategy:
+                predicted_d = sdpa_kwargs.get("predicted_d")
+                if predicted_d is not None:
+                    sdpa_kwargs["predicted_d"] = _transform_depth_uncertainty(
+                        predicted_d,
+                        depth_uncertainty_transform,
+                        self.attention.num_patches,
+                    )
+                if uncertainty_sample_seed is not None:
+                    generator = torch.Generator(device=q.device)
+                    generator.manual_seed(
+                        int(uncertainty_sample_seed) + attention_call_index
+                    )
+                    sdpa_kwargs["generator"] = generator
+                attention_call_index += 1
             if config.pos_enc == "gta":
                 # GTA is effectively PRoPE without intrinsics.
                 return self.attention(q, k, v, viewmats=viewmats, Ks=None, timing_enabled=timing_enabled, **sdpa_kwargs)

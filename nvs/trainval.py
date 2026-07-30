@@ -60,10 +60,81 @@ def _repository_path(relative_path: str) -> str:
 
 
 def _model_uses_pose_sigma(model_config: object) -> bool:
+    strategy = getattr(model_config, "uncertainty_strategy", None)
     return bool(
         getattr(model_config, "use_pose_uncertainty", False)
         or getattr(model_config, "use_pose_uncertainty_cf", False)
+        or strategy in ("linearized_shared_sample", "nonlinear_shared_sample")
     )
+
+
+def _curriculum_noise_values(
+    step: int,
+    curriculum_steps: int,
+    dirty_probability_final: float,
+    rot_sigma_max: float,
+    trans_sigma_max: float,
+) -> tuple[float, float, float]:
+    """Resolve the double-linear clean/dirty curriculum at one optimizer step."""
+
+    if step < 0 or curriculum_steps < 0:
+        raise ValueError("step and curriculum_steps must be non-negative")
+    if not 0.0 <= dirty_probability_final <= 1.0:
+        raise ValueError("dirty_probability_final must lie in [0,1]")
+    if rot_sigma_max < 0.0 or trans_sigma_max < 0.0:
+        raise ValueError("sigma maxima must be non-negative")
+    progress = 1.0 if curriculum_steps == 0 else min(step / curriculum_steps, 1.0)
+    return (
+        dirty_probability_final * progress,
+        rot_sigma_max * progress,
+        trans_sigma_max * progress,
+    )
+
+
+def _uncertainty_forward_seed(run_seed: int, step: int, acc_step: int, mc: int = 0) -> int:
+    """Stable seed namespace for owner samples, independent of Python hashing."""
+
+    if min(run_seed, step, acc_step, mc) < 0:
+        raise ValueError("uncertainty seed components must be non-negative")
+    payload = f"owner-shared-v1:{run_seed}:{step}:{acc_step}:{mc}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+
+
+def _pose_noise_train_seed(noise_seed: int, step: int, acc_step: int) -> int:
+    """Derive an independent, reproducible corruption stream per microbatch."""
+
+    if min(noise_seed, step, acc_step) < 0:
+        raise ValueError("pose-noise seed components must be non-negative")
+    payload = f"pose-noise-v1:{noise_seed}:{step}:{acc_step}".encode("ascii")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
+
+
+def _effective_uncertainty_mc_samples(model_config: object, requested: int) -> int:
+    """Avoid repeating a deterministic control while retaining requested provenance."""
+
+    if requested < 1:
+        raise ValueError("uncertainty_mc_samples must be positive")
+    return 1 if getattr(model_config, "uncertainty_strategy", None) == "none" else requested
+
+
+def _uncertainty_intervention_modes(
+    intervention: str, legacy_pose_transform: str = "true"
+) -> tuple[str, str]:
+    """Resolve one named intervention into independent pose/depth transforms."""
+
+    if intervention == "true":
+        return legacy_pose_transform, "true"
+    modes = {
+        "pose_zero": ("zero", "true"),
+        "pose_permute": ("permute", "true"),
+        "depth_zero": ("true", "zero"),
+        "depth_permute_within_camera": ("true", "permute_within_camera"),
+        "all_zero": ("zero", "zero"),
+    }
+    try:
+        return modes[intervention]
+    except KeyError as error:
+        raise ValueError(f"unsupported uncertainty intervention {intervention!r}") from error
 
 
 def _re10k_train_scenes(
@@ -221,6 +292,9 @@ class LVSMLauncherConfig(LauncherConfig):
     pose_noise_trans_train_lo: float = 0.0
     pose_noise_trans_train_hi: float = 0.05
     pose_noise_max_corrupt: int = 2  # train: k ~ Uniform{0..max_corrupt} of ref corrupted
+    pose_noise_min_corrupt: int = 0
+    pose_noise_curriculum_steps: int = 0
+    pose_noise_dirty_prob_final: float = 1.0
     pose_noise_test_levels: str = "0,0.01,0.02,0.05,0.1"  # rot level list (=trans level)
     pose_noise_test_corrupt: int = 2  # test: fixed N of ref corrupted
     pose_noise_seed: int = 1234
@@ -232,6 +306,8 @@ class LVSMLauncherConfig(LauncherConfig):
     # corrupted). Only takes effect when the model is pose-aware (use_pose_uncertainty)
     # and pose_noise_enabled; blind/RayRoPE ignore it (they get None anyway).
     pose_noise_test_sigma_transform: str = "true"
+    uncertainty_mc_samples: int = 1
+    uncertainty_intervention: str = "true"
 
 
 class LVSMLauncher(Launcher):
@@ -310,6 +386,8 @@ class LVSMLauncher(Launcher):
         context_depths: Optional[Tensor] = None,
         pose_sigma_overrides: Optional[dict] = None,
         timing_enabled: bool = False,
+        uncertainty_sample_seed: Optional[int] = None,
+        depth_uncertainty_transform: str = "true",
     ) -> Tensor:
         """Evaluate independent target views in bounded-memory chunks."""
 
@@ -323,6 +401,8 @@ class LVSMLauncher(Launcher):
                 context_depths=context_depths,
                 pose_sigma_overrides=pose_sigma_overrides,
                 timing_enabled=timing_enabled,
+                uncertainty_sample_seed=uncertainty_sample_seed,
+                depth_uncertainty_transform=depth_uncertainty_transform,
             )
         if chunk_size <= 0:
             raise ValueError("test_target_view_chunk_size must be positive")
@@ -344,6 +424,8 @@ class LVSMLauncher(Launcher):
                     context_depths=context_depths,
                     pose_sigma_overrides=pose_sigma_overrides,
                     timing_enabled=timing_enabled,
+                    uncertainty_sample_seed=uncertainty_sample_seed,
+                    depth_uncertainty_transform=depth_uncertainty_transform,
                 )
             )
         return torch.cat(outputs, dim=1)
@@ -609,15 +691,39 @@ class LVSMLauncher(Launcher):
             V1 = ref_cams.camtoworld.shape[1]
             B = ref_cams.camtoworld.shape[0]
             gen = torch.Generator(device=self.device).manual_seed(
-                self.config.pose_noise_seed + step)
-            mask = sample_corrupt_subset(
-                V1, self.config.pose_noise_max_corrupt,
-                batch_size=B, device=self.device, generator=gen)
+                _pose_noise_train_seed(self.config.pose_noise_seed, step, acc_step)
+            )
+            dirty_probability, rot_hi, trans_hi = _curriculum_noise_values(
+                step,
+                self.config.pose_noise_curriculum_steps,
+                self.config.pose_noise_dirty_prob_final,
+                self.config.pose_noise_rot_train_hi,
+                self.config.pose_noise_trans_train_hi,
+            )
+            if self.config.pose_noise_rot_train_lo > rot_hi:
+                raise ValueError("pose_noise_rot_train_lo exceeds the current curriculum maximum")
+            if self.config.pose_noise_trans_train_lo > trans_hi:
+                raise ValueError("pose_noise_trans_train_lo exceeds the current curriculum maximum")
+            if not 0 <= self.config.pose_noise_min_corrupt <= self.config.pose_noise_max_corrupt <= V1:
+                raise ValueError("pose noise corrupt-count bounds are invalid")
+            dirty = torch.rand(B, device=self.device, generator=gen) < dirty_probability
+            mask = torch.zeros(B, V1, dtype=torch.bool, device=self.device)
+            for batch_index in range(B):
+                if not bool(dirty[batch_index]):
+                    continue
+                count = int(torch.randint(
+                    self.config.pose_noise_min_corrupt,
+                    self.config.pose_noise_max_corrupt + 1,
+                    (1,), device=self.device, generator=gen,
+                ).item())
+                if count:
+                    indices = torch.randperm(V1, device=self.device, generator=gen)[:count]
+                    mask[batch_index, indices] = True
             u = torch.rand(B, device=self.device, generator=gen)
             rot_std = self.config.pose_noise_rot_train_lo + (
-                self.config.pose_noise_rot_train_hi - self.config.pose_noise_rot_train_lo) * u
+                rot_hi - self.config.pose_noise_rot_train_lo) * u
             trans_std = self.config.pose_noise_trans_train_lo + (
-                self.config.pose_noise_trans_train_hi - self.config.pose_noise_trans_train_lo) * u
+                trans_hi - self.config.pose_noise_trans_train_lo) * u
             per_cam_rot = torch.where(mask, rot_std[:, None], torch.zeros_like(rot_std[:, None]))
             per_cam_trans = torch.where(mask, trans_std[:, None], torch.zeros_like(trans_std[:, None]))
             ref_cams, pose_sigma_overrides = self._apply_pose_noise(
@@ -646,7 +752,10 @@ class LVSMLauncher(Launcher):
                         context_depths=context_depths,
                         timing_enabled=timing_enabled,
                         pose_sigma_overrides=pose_sigma_overrides,
-                        pose_sigma_seed=pose_sigma_seed)
+                        pose_sigma_seed=pose_sigma_seed,
+                        uncertainty_sample_seed=_uncertainty_forward_seed(
+                            self.config.seed, step, acc_step
+                        ))
                 outputs = torch.sigmoid(outputs)
 
                 if self.config.get_mask:
@@ -1011,6 +1120,13 @@ class LVSMLauncher(Launcher):
         dataloaders = state["dataloaders"]
         model = state["model"]
         model.eval()
+        effective_mc_samples = _effective_uncertainty_mc_samples(
+            self.config.model_config, self.config.uncertainty_mc_samples
+        )
+        pose_transform, depth_transform = _uncertainty_intervention_modes(
+            self.config.uncertainty_intervention,
+            self.config.pose_noise_test_sigma_transform,
+        )
         levels = self._pose_test_levels()
         for rot_std, trans_std, tag in levels:
             for label, (input_views, dataloader) in dataloaders.items():
@@ -1040,10 +1156,10 @@ class LVSMLauncher(Launcher):
                             ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
                         if not _model_uses_pose_sigma(self.config.model_config):
                             pose_sigma_overrides = None
-                        elif self.config.pose_noise_test_sigma_transform != "true":
+                        elif pose_transform != "true":
                             pose_sigma_overrides = self._transform_test_sigma(
                                 pose_sigma_overrides, n, self._num_patches(),
-                                self.config.pose_noise_test_sigma_transform)
+                                pose_transform)
                     corruption_records.append(
                         {
                             "rank": self.world_rank,
@@ -1051,21 +1167,36 @@ class LVSMLauncher(Launcher):
                             "digest": _camera_input_digest(ref_cams),
                         }
                     )
-                    with torch.amp.autocast("cuda", enabled=self.config.amp, dtype=self.amp_dtype):
-                        outputs = self._forward_test_target_views(
-                            model,
-                            ref_imgs,
-                            ref_cams,
-                            tar_cams,
-                            context_depths=context_depths,
-                            pose_sigma_overrides=pose_sigma_overrides,
+                    target_images = rearrange(
+                        tar_imgs, "b v h w c -> (b v) c h w"
+                    )
+                    draw_psnr, draw_ssim, draw_lpips = [], [], []
+                    for mc_index in range(effective_mc_samples):
+                        with torch.amp.autocast(
+                            "cuda", enabled=self.config.amp, dtype=self.amp_dtype
+                        ):
+                            outputs = self._forward_test_target_views(
+                                model,
+                                ref_imgs,
+                                ref_cams,
+                                tar_cams,
+                                context_depths=context_depths,
+                                pose_sigma_overrides=pose_sigma_overrides,
+                                uncertainty_sample_seed=_uncertainty_forward_seed(
+                                    self.config.seed, step + idx, 0, mc_index
+                                ),
+                                depth_uncertainty_transform=depth_transform,
+                            )
+                            outputs = torch.sigmoid(outputs)
+                        outputs = rearrange(
+                            outputs, "b v h w c -> (b v) c h w"
                         )
-                        outputs = torch.sigmoid(outputs)
-                    outputs = rearrange(outputs, "b v h w c -> (b v) c h w")
-                    tar_imgs = rearrange(tar_imgs, "b v h w c -> (b v) c h w")
-                    psnrs.append(state["psnr_fn"](outputs, tar_imgs))
-                    ssims.append(state["ssim_fn"](outputs, tar_imgs))
-                    lpips.append(state["lpips_fn"](outputs, tar_imgs))
+                        draw_psnr.append(state["psnr_fn"](outputs, target_images))
+                        draw_ssim.append(state["ssim_fn"](outputs, target_images))
+                        draw_lpips.append(state["lpips_fn"](outputs, target_images))
+                    psnrs.append(torch.stack(draw_psnr).mean(dim=0))
+                    ssims.append(torch.stack(draw_ssim).mean(dim=0))
+                    lpips.append(torch.stack(draw_lpips).mean(dim=0))
                     if tar_paths is not None:
                         per_scene_records.append(
                             build_scene_metric_record(
@@ -1108,9 +1239,11 @@ class LVSMLauncher(Launcher):
                     "psnr": avg_psnr,
                     "ssim": avg_ssim,
                     "lpips": avg_lpips,
-                    "sigma_transform": getattr(
-                        self.config, "pose_noise_test_sigma_transform", "true"
-                    ),
+                    "sigma_transform": pose_transform,
+                    "depth_uncertainty_transform": depth_transform,
+                    "uncertainty_intervention": self.config.uncertainty_intervention,
+                    "uncertainty_mc_samples": self.config.uncertainty_mc_samples,
+                    "effective_uncertainty_mc_samples": effective_mc_samples,
                     "corruption_digest_kind": "post_noise_camtoworld_sha256_v1",
                     "corruption_digest": corruption_digest,
                 }

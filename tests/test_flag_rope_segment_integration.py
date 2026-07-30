@@ -3,7 +3,11 @@
 import torch
 import torch.nn.functional as F
 
-from nvs.lvsm import LVSMDecoderOnlyModel, LVSMDecoderOnlyModelConfig
+from nvs.lvsm import (
+    LVSMDecoderOnlyModel,
+    LVSMDecoderOnlyModelConfig,
+    _physical_uncertainty_from_pose_sigma,
+)
 from pos_enc.utils.transformer import (
     TransformerEncoderConfig,
     TransformerEncoderLayerConfig,
@@ -108,3 +112,41 @@ def test_five_arm_modes_keep_parameter_shapes_and_seeded_initialization_equal():
         for name in reference:
             assert state[name].shape == reference[name].shape
             assert torch.equal(state[name], reference[name]), name
+
+
+def test_lvsm_threads_owner_shared_configuration_into_flag_rope():
+    config = _config("dual")
+    config.head_aware_frequency_layout = True
+    config.rope_family = "ray_point"
+    config.uncertainty_strategy = "linearized_shared_sample"
+
+    model = LVSMDecoderOnlyModel(config)
+
+    assert model.attention.config.rope_family == "ray_point"
+    assert (
+        model.attention.config.uncertainty_strategy
+        == "linearized_shared_sample"
+    )
+
+
+def test_lvsm_converts_token_expanded_pose_sigma_back_to_camera_owners():
+    rot_camera = torch.tensor([[0.1, 0.2, 0.0]])
+    trans_camera = torch.tensor([[1.0, 2.0, 0.0]])
+    patches = 4
+    sigma = {
+        "pose_rot": rot_camera.repeat_interleave(patches, dim=1).unsqueeze(1),
+        "pose_trans": trans_camera.repeat_interleave(patches, dim=1).unsqueeze(1),
+    }
+
+    uncertainty = _physical_uncertainty_from_pose_sigma(
+        sigma,
+        batch_size=2,
+        camera_count=3,
+        num_patches=patches,
+    )
+
+    assert uncertainty.pose is not None
+    assert uncertainty.pose.scale.shape == (2, 3, 6)
+    assert torch.equal(uncertainty.pose.scale[0, :, 0], rot_camera[0])
+    assert torch.equal(uncertainty.pose.scale[0, :, 3], trans_camera[0])
+    assert torch.equal(uncertainty.pose.scale[0], uncertainty.pose.scale[1])
