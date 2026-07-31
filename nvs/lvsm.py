@@ -30,6 +30,7 @@ from pos_enc.utils.transformer import (
     TransformerEncoderLayerConfig,
 )
 from nvs.depth_width_observability import DepthWidthObservabilityRecorder
+from nvs.depth_width_calibration import DepthWidthCalibrationRecorder
 
 
 def _physical_uncertainty_from_pose_sigma(
@@ -489,7 +490,9 @@ class LVSMDecoderOnlyModel(nn.Module):
         pose_sigma_seed: Optional[dict] = None,
         uncertainty_sample_seed: Optional[int] = None,
         depth_uncertainty_transform: str = "true",
-        depth_observability_recorder: Optional[DepthWidthObservabilityRecorder] = None,
+        depth_observability_recorder: Optional[
+            DepthWidthObservabilityRecorder | DepthWidthCalibrationRecorder
+        ] = None,
     ) -> Tensor:
 
         with time_block("preprocess", enabled=timing_enabled):
