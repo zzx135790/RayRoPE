@@ -28,6 +28,7 @@ from nvs.lvsm import (
     LVSMDecoderOnlyModel,
     LVSMDecoderOnlyModelConfig,
 )
+from nvs.depth_width_observability import DepthWidthObservabilityRecorder
 from tokenmap.experiments.flag_rope.pose_noise import (
     apply_pose_noise_to_c2w,
     build_pose_sigma_overrides,
@@ -308,6 +309,12 @@ class LVSMLauncherConfig(LauncherConfig):
     pose_noise_test_sigma_transform: str = "true"
     uncertainty_mc_samples: int = 1
     uncertainty_intervention: str = "true"
+    # Evaluation-only direct observability audit. It records token depth widths,
+    # counterfactual phase response, and sampled attention-logit response.
+    depth_width_observability_only: bool = False
+    depth_width_observability_output: Optional[str] = None
+    depth_width_observability_query_samples: int = 4
+    depth_width_observability_key_samples_per_camera: int = 4
 
 
 class LVSMLauncher(Launcher):
@@ -388,12 +395,15 @@ class LVSMLauncher(Launcher):
         timing_enabled: bool = False,
         uncertainty_sample_seed: Optional[int] = None,
         depth_uncertainty_transform: str = "true",
+        depth_observability_recorder: Optional[DepthWidthObservabilityRecorder] = None,
     ) -> Tensor:
         """Evaluate independent target views in bounded-memory chunks."""
 
         chunk_size = self.config.test_target_view_chunk_size
         target_views = tar_cams.camtoworld.shape[1]
         if chunk_size is None or chunk_size >= target_views:
+            if depth_observability_recorder is not None:
+                depth_observability_recorder.begin_forward(0)
             return model(
                 ref_imgs,
                 ref_cams,
@@ -403,6 +413,7 @@ class LVSMLauncher(Launcher):
                 timing_enabled=timing_enabled,
                 uncertainty_sample_seed=uncertainty_sample_seed,
                 depth_uncertainty_transform=depth_uncertainty_transform,
+                depth_observability_recorder=depth_observability_recorder,
             )
         if chunk_size <= 0:
             raise ValueError("test_target_view_chunk_size must be positive")
@@ -416,6 +427,8 @@ class LVSMLauncher(Launcher):
                 width=tar_cams.width,
                 height=tar_cams.height,
             )
+            if depth_observability_recorder is not None:
+                depth_observability_recorder.begin_forward(start)
             outputs.append(
                 model(
                     ref_imgs,
@@ -426,6 +439,7 @@ class LVSMLauncher(Launcher):
                     timing_enabled=timing_enabled,
                     uncertainty_sample_seed=uncertainty_sample_seed,
                     depth_uncertainty_transform=depth_uncertainty_transform,
+                    depth_observability_recorder=depth_observability_recorder,
                 )
             )
         return torch.cat(outputs, dim=1)
@@ -1273,7 +1287,99 @@ class LVSMLauncher(Launcher):
         self.pose_noise_test_sweep(step, state)
 
     @torch.inference_mode()
+    def depth_width_observability_audit(
+        self, step: int, state: Dict[str, Any]
+    ) -> None:
+        """Trace direct depth-width response without training or metric selection."""
+
+        if self.world_size != 1:
+            raise ValueError("depth-width observability requires one distributed rank")
+        output_raw = self.config.depth_width_observability_output
+        if not output_raw:
+            raise ValueError("depth-width observability requires an output path")
+        output_path = Path(output_raw)
+        if not output_path.is_absolute():
+            raise ValueError("depth-width observability output must be absolute")
+        if self.config.test_supervise_views != 1:
+            raise ValueError("depth-width observability requires one target view per scene")
+        model_config = self.config.model_config
+        strategy = getattr(model_config, "uncertainty_strategy", None)
+        family = getattr(model_config, "rope_family", None)
+        if strategy not in (
+            "linearized_shared_sample",
+            "nonlinear_shared_sample",
+        ):
+            raise ValueError("depth-width observability requires sampled owner sharing")
+        if family not in ("ray", "ray_point", "segment_bounds"):
+            raise ValueError("depth-width observability requires a named RoPE family")
+        if self.config.uncertainty_intervention != "true":
+            raise ValueError(
+                "depth-width observability traces counterfactuals from the true path"
+            )
+
+        recorder = DepthWidthObservabilityRecorder(
+            num_patches=self._num_patches(),
+            family=family,
+            strategy=strategy,
+            query_samples=self.config.depth_width_observability_query_samples,
+            key_samples_per_camera=(
+                self.config.depth_width_observability_key_samples_per_camera
+            ),
+        )
+        model = state["model"]
+        model.eval()
+        scene_count = 0
+        labels = []
+        for label, (input_views, dataloader) in state["dataloaders"].items():
+            labels.append(label)
+            for idx, data in enumerate(dataloader):
+                processed = self.preprocess(data, input_views=input_views)
+                ref_imgs = processed["ref_imgs"]
+                ref_cams = processed["ref_cams"]
+                tar_cams = processed["tar_cams"]
+                tar_paths = np.asarray(processed["tar_paths"], dtype=object).reshape(-1)
+                if tar_paths.size == 0:
+                    raise ValueError("observability scene has no target path")
+                scene_path = Path(str(tar_paths[0]))
+                if len(scene_path.parents) < 2:
+                    raise ValueError("observability target path does not identify a scene")
+                scene_id = scene_path.parents[1].name
+                recorder.begin_scene(scene_id=scene_id, scene_index=idx, mc_index=0)
+                with torch.amp.autocast(
+                    "cuda", enabled=self.config.amp, dtype=self.amp_dtype
+                ):
+                    self._forward_test_target_views(
+                        model,
+                        ref_imgs,
+                        ref_cams,
+                        tar_cams,
+                        context_depths=processed.get("context_depths"),
+                        uncertainty_sample_seed=_uncertainty_forward_seed(
+                            self.config.seed, step + idx, 0, 0
+                        ),
+                        depth_uncertainty_transform="true",
+                        depth_observability_recorder=recorder,
+                    )
+                scene_count += 1
+        recorder.finalize(
+            output_path,
+            metadata={
+                "step": step,
+                "scene_count": scene_count,
+                "dataloader_labels": labels,
+                "seed": self.config.seed,
+                "test_input_views": self.config.test_input_views,
+                "test_supervise_views": self.config.test_supervise_views,
+            },
+        )
+        self.logging_on_master(
+            f"Saved depth-width observability audit to {output_path}"
+        )
+
+    @torch.inference_mode()
     def test_iteration(self, step: int, state: Dict[str, Any]) -> None:
+        if getattr(self.config, "depth_width_observability_only", False):
+            return self.depth_width_observability_audit(step, state)
         if self.config.pose_noise_enabled:
             return self.pose_noise_test_sweep(step, state)
         dataloaders = state["dataloaders"]

@@ -29,6 +29,7 @@ from pos_enc.utils.transformer import (
     TransformerEncoderConfig,
     TransformerEncoderLayerConfig,
 )
+from nvs.depth_width_observability import DepthWidthObservabilityRecorder
 
 
 def _physical_uncertainty_from_pose_sigma(
@@ -488,6 +489,7 @@ class LVSMDecoderOnlyModel(nn.Module):
         pose_sigma_seed: Optional[dict] = None,
         uncertainty_sample_seed: Optional[int] = None,
         depth_uncertainty_transform: str = "true",
+        depth_observability_recorder: Optional[DepthWidthObservabilityRecorder] = None,
     ) -> Tensor:
 
         with time_block("preprocess", enabled=timing_enabled):
@@ -589,10 +591,23 @@ class LVSMDecoderOnlyModel(nn.Module):
             if shared_strategy:
                 predicted_d = sdpa_kwargs.get("predicted_d")
                 if predicted_d is not None:
-                    sdpa_kwargs["predicted_d"] = _transform_depth_uncertainty(
+                    transformed_d = _transform_depth_uncertainty(
                         predicted_d,
                         depth_uncertainty_transform,
                         self.attention.num_patches,
+                    )
+                    sdpa_kwargs["predicted_d"] = transformed_d
+                    if depth_observability_recorder is not None:
+                        sdpa_kwargs["depth_observability"] = (
+                            depth_observability_recorder.request(
+                                layer_index=attention_call_index,
+                                original_predicted_d=predicted_d,
+                                actual_predicted_d=transformed_d,
+                            )
+                        )
+                elif depth_observability_recorder is not None:
+                    raise ValueError(
+                        "depth observability requires per-layer predicted depth widths"
                     )
                 if uncertainty_sample_seed is not None:
                     generator = torch.Generator(device=q.device)
