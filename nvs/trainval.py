@@ -30,6 +30,7 @@ from nvs.lvsm import (
 )
 from nvs.depth_width_observability import DepthWidthObservabilityRecorder
 from nvs.depth_width_calibration import DepthWidthCalibrationRecorder
+from nvs.depth_width_scale_calibration import DepthWidthScaleCalibrationRecorder
 from tokenmap.experiments.flag_rope.pose_noise import (
     apply_pose_noise_to_c2w,
     build_pose_sigma_overrides,
@@ -322,6 +323,13 @@ class LVSMLauncherConfig(LauncherConfig):
     depth_width_calibration_output: Optional[str] = None
     depth_width_calibration_query_samples: int = 4
     depth_width_calibration_key_samples_per_camera: int = 4
+    # V2 separates 31-scene source statistics from the 8-scene formal gate.
+    depth_width_scale_calibration_only: bool = False
+    depth_width_scale_calibration_output: Optional[str] = None
+    depth_width_scale_calibration_stage: str = "source_audit"
+    depth_width_scale_calibration_layer_medians: Optional[str] = None
+    depth_width_scale_calibration_query_samples: int = 4
+    depth_width_scale_calibration_key_samples_per_camera: int = 4
 
 
 class LVSMLauncher(Launcher):
@@ -1471,7 +1479,115 @@ class LVSMLauncher(Launcher):
         )
 
     @torch.inference_mode()
+    def depth_width_scale_calibration_audit(
+        self, step: int, state: Dict[str, Any]
+    ) -> None:
+        """Collect train-source widths or formal v2 scale/wavelength responses."""
+
+        if self.world_size != 1:
+            raise ValueError("depth-width scale calibration requires one rank")
+        if self.config.depth_width_observability_only or self.config.depth_width_calibration_only:
+            raise ValueError("depth-width audit modes are mutually exclusive")
+        output_raw = self.config.depth_width_scale_calibration_output
+        if not output_raw:
+            raise ValueError("depth-width scale calibration requires an output path")
+        output_path = Path(output_raw)
+        if not output_path.is_absolute():
+            raise ValueError("depth-width scale calibration output must be absolute")
+        if self.config.test_supervise_views != 1:
+            raise ValueError("depth-width scale calibration requires one target view")
+        model_config = self.config.model_config
+        strategy = getattr(model_config, "uncertainty_strategy", None)
+        family = getattr(model_config, "rope_family", None)
+        if strategy != "linearized_shared_sample":
+            raise ValueError("depth-width scale calibration requires linearized owner sharing")
+        if family not in ("ray", "ray_point", "segment_bounds"):
+            raise ValueError("depth-width scale calibration requires a named RoPE family")
+        if self.config.uncertainty_intervention != "true":
+            raise ValueError("depth-width scale calibration starts from the true path")
+        stage = self.config.depth_width_scale_calibration_stage
+        layer_medians = {}
+        if self.config.depth_width_scale_calibration_layer_medians:
+            layer_medians = json.loads(
+                self.config.depth_width_scale_calibration_layer_medians
+            )
+            if not isinstance(layer_medians, dict):
+                raise ValueError("depth-width layer medians must be a JSON object")
+
+        recorder = DepthWidthScaleCalibrationRecorder(
+            num_patches=self._num_patches(),
+            family=family,
+            strategy=strategy,
+            stage=stage,
+            layer_medians=layer_medians,
+            query_samples=self.config.depth_width_scale_calibration_query_samples,
+            key_samples_per_camera=(
+                self.config.depth_width_scale_calibration_key_samples_per_camera
+            ),
+        )
+        model = state["model"]
+        model.eval()
+        scene_count = 0
+        labels = []
+        for label, (input_views, dataloader) in state["dataloaders"].items():
+            labels.append(label)
+            for idx, data in enumerate(dataloader):
+                processed = self.preprocess(data, input_views=input_views)
+                ref_imgs = processed["ref_imgs"]
+                ref_cams = processed["ref_cams"]
+                tar_cams = processed["tar_cams"]
+                tar_paths = np.asarray(processed["tar_paths"], dtype=object).reshape(-1)
+                if tar_paths.size == 0:
+                    raise ValueError("scale-calibration scene has no target path")
+                scene_path = Path(str(tar_paths[0]))
+                if len(scene_path.parents) < 2:
+                    raise ValueError("scale-calibration target path does not identify a scene")
+                centers = ref_cams.camtoworld[..., :3, 3]
+                baseline = torch.linalg.vector_norm(
+                    centers - centers[:, :1], dim=-1
+                ).amax()
+                recorder.begin_scene(
+                    scene_id=scene_path.parents[1].name,
+                    scene_index=idx,
+                    mc_index=0,
+                    context_baseline_max=float(baseline.item()),
+                )
+                with torch.amp.autocast(
+                    "cuda", enabled=self.config.amp, dtype=self.amp_dtype
+                ):
+                    self._forward_test_target_views(
+                        model,
+                        ref_imgs,
+                        ref_cams,
+                        tar_cams,
+                        context_depths=processed.get("context_depths"),
+                        uncertainty_sample_seed=_uncertainty_forward_seed(
+                            self.config.seed, step + idx, 0, 0
+                        ),
+                        depth_uncertainty_transform="true",
+                        depth_observability_recorder=recorder,
+                    )
+                scene_count += 1
+        recorder.finalize(
+            output_path,
+            metadata={
+                "step": step,
+                "stage": stage,
+                "scene_count": scene_count,
+                "dataloader_labels": labels,
+                "seed": self.config.seed,
+                "test_input_views": self.config.test_input_views,
+                "test_supervise_views": self.config.test_supervise_views,
+            },
+        )
+        self.logging_on_master(
+            f"Saved depth-width scale calibration audit to {output_path}"
+        )
+
+    @torch.inference_mode()
     def test_iteration(self, step: int, state: Dict[str, Any]) -> None:
+        if getattr(self.config, "depth_width_scale_calibration_only", False):
+            return self.depth_width_scale_calibration_audit(step, state)
         if getattr(self.config, "depth_width_calibration_only", False):
             return self.depth_width_calibration_audit(step, state)
         if getattr(self.config, "depth_width_observability_only", False):
