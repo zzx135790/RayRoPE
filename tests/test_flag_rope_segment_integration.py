@@ -120,8 +120,13 @@ def test_lvsm_threads_owner_shared_configuration_into_flag_rope():
     config.rope_family = "ray_point"
     config.uncertainty_strategy = "linearized_shared_sample"
     config.nonlinear_sample_chunk_size = 7
+    config.depth_width_calibrator = "raw_multiplier"
+    config.depth_width_scale = 1.0 / 512.0
 
     model = LVSMDecoderOnlyModel(config)
+
+    assert model.attention.config.depth_width_calibrator == "raw_multiplier"
+    assert model.attention.config.depth_width_scale == 1.0 / 512.0
 
     assert model.attention.config.rope_family == "ray_point"
     assert (

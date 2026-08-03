@@ -156,6 +156,10 @@ class LVSMDecoderOnlyModelConfig:
     ] = None
     # Execution-only bound for vectorized nonlinear owner samples.
     nonlinear_sample_chunk_size: int = 16
+    # Source calibration for predict_dsig's raw log-depth half-width. The
+    # FlagRoPE source boundary applies this once for every runtime depth path.
+    depth_width_calibrator: Literal["identity", "raw_multiplier"] = "identity"
+    depth_width_scale: float = 1.0
     
     denc_type: str = "d"  # "d" or "inv_d" or "asinh_d"
     depth_input: bool = False # concat context depth map to ref input
@@ -331,6 +335,8 @@ class LVSMDecoderOnlyModel(nn.Module):
                 rope_family=self.config.rope_family,
                 uncertainty_strategy=self.config.uncertainty_strategy,
                 nonlinear_sample_chunk_size=self.config.nonlinear_sample_chunk_size,
+                depth_width_calibrator=self.config.depth_width_calibrator,
+                depth_width_scale=self.config.depth_width_scale,
                 use_uncertainty_perturbation=False,
                 scene_scale_source=self.config.scene_scale_source,
                 normalize_transform=self.config.normalize_transform,
