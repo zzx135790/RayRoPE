@@ -3,6 +3,7 @@ Implementation of https://arxiv.org/abs/2410.17242
 """
 
 from dataclasses import dataclass, field
+import copy
 from typing import List, Literal, Optional, Tuple
 
 import torch
@@ -94,6 +95,113 @@ def _transform_depth_uncertainty(
     widths = result[..., 1].reshape(result.shape[0], camera_count, num_patches)
     result[..., 1] = torch.roll(widths, shifts=1, dims=2).reshape(result.shape[0], -1)
     return result
+
+
+def _sample_layerwise_depth_tokens(
+    context_depths: Optional[torch.Tensor],
+    *,
+    target_views: int,
+    patch_size: int,
+    reference_views: int,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Mask-aware patch means for external reference depth.
+
+    Validity is computed before any numerical replacement.  A patch is
+    available when at least one finite, positive source pixel is present; target
+    tokens and empty reference patches remain explicit zero-length geometry.
+    """
+
+    if context_depths is None:
+        return None, None
+    if context_depths.ndim != 5 or context_depths.shape[-1] != 1:
+        raise ValueError("context_depths must have shape [B,V,H,W,1]")
+    batch, views, height, width, _ = context_depths.shape
+    if views != reference_views:
+        raise ValueError("context depth view count does not match reference cameras")
+    if height % patch_size or width % patch_size:
+        raise ValueError("context depth resolution must be divisible by patch_size")
+
+    values = context_depths[..., 0]
+    valid = torch.isfinite(values) & (values > 0)
+    safe_values = torch.where(valid, values, torch.zeros_like(values))
+    flat_values = safe_values.reshape(batch * views, 1, height, width)
+    flat_valid = valid.to(values.dtype).reshape(batch * views, 1, height, width)
+    value_mean = F.avg_pool2d(flat_values, patch_size, stride=patch_size)
+    valid_fraction = F.avg_pool2d(flat_valid, patch_size, stride=patch_size)
+    patch_available = valid_fraction > 0
+    patch_depth = value_mean / valid_fraction.clamp_min(
+        torch.finfo(values.dtype).eps
+    )
+    patch_depth = torch.where(
+        patch_available, patch_depth, torch.ones_like(patch_depth)
+    )
+    patch_depth = patch_depth.reshape(batch, views, -1)
+    patch_available = patch_available.reshape(batch, views, -1)
+    patch_count = patch_depth.shape[-1]
+
+    repeated_depth = repeat(
+        patch_depth, "b v p -> (b vt) v p", vt=target_views
+    )
+    repeated_available = repeat(
+        patch_available, "b v p -> (b vt) v p", vt=target_views
+    )
+    target_depth = torch.ones(
+        batch * target_views,
+        1,
+        patch_count,
+        device=values.device,
+        dtype=values.dtype,
+    )
+    target_available = torch.zeros(
+        batch * target_views,
+        1,
+        patch_count,
+        device=values.device,
+        dtype=torch.bool,
+    )
+    return (
+        torch.cat((repeated_depth, target_depth), dim=1).reshape(
+            batch * target_views, -1
+        ),
+        torch.cat((repeated_available, target_available), dim=1).reshape(
+            batch * target_views, -1
+        ),
+    )
+
+
+def _prepare_depth_input(
+    context_depths: Optional[torch.Tensor],
+    *,
+    reference_images: torch.Tensor,
+) -> torch.Tensor:
+    """Build a finite inverse-depth input while preserving missing-depth holes."""
+
+    if reference_images.ndim != 5 or reference_images.shape[-1] < 1:
+        raise ValueError("reference_images must have shape [B,V,H,W,C]")
+    batch, views, height, width = reference_images.shape[:4]
+    if context_depths is None:
+        return torch.zeros(
+            batch,
+            views,
+            height,
+            width,
+            1,
+            device=reference_images.device,
+            dtype=reference_images.dtype,
+        )
+    if context_depths.ndim != 5 or context_depths.shape[-1] != 1:
+        raise ValueError("context_depths must have shape [B,V,H,W,1]")
+    if tuple(context_depths.shape[:4]) != (batch, views, height, width):
+        raise ValueError("context_depths must match reference image dimensions")
+    depths = context_depths.to(
+        device=reference_images.device, dtype=reference_images.dtype
+    )
+    valid = torch.isfinite(depths) & (depths > 0)
+    safe_depths = torch.where(valid, depths, torch.ones_like(depths))
+    inverse = safe_depths.reciprocal()
+    # Zero is the finite input-channel sentinel for an unavailable depth.  The
+    # geometry path carries the authoritative availability mask separately.
+    return torch.where(valid, inverse, torch.zeros_like(inverse))
 
 
 @dataclass
@@ -221,6 +329,38 @@ class LVSMDecoderOnlyModelConfig:
     pose_sigma_init_value: float = 1e-2
     recurrent_mu_clamp: Optional[float] = None
     recurrent_sigma_cap: Optional[float] = None
+    # Owner-aware post-block recurrence. Layer 0 consumes mean geometry only;
+    # five untied side heads update the six-layer model for the following layer.
+    layerwise_belief_mode: Literal[
+        "none", "mean_only", "joint", "identity", "pose_mean", "amplitude_only"
+    ] = "none"
+    layerwise_belief_policy: Optional[
+        Literal["identity", "pose_mean", "amplitude_only", "joint"]
+    ] = None
+    layerwise_update_parameterization: Literal[
+        "bounded_residual", "recurrent_delta"
+    ] = "bounded_residual"
+    layerwise_edge_mask: tuple[bool, bool, bool, bool, bool] = (True, True, True, True, True)
+    layerwise_freeze_pose: bool = False
+    layerwise_freeze_amplitude: bool = False
+    layerwise_pose_intervention: Literal["true", "permute_within_owner"] = "true"
+    layerwise_pose_scale_init: float = 1e-2
+    layerwise_depth_width_scale: float = 1.0 / 512.0
+    layerwise_rotation_cap: float = 0.05
+    layerwise_translation_cap: float = 0.05
+    layerwise_log_depth_cap: float = 0.5
+    layerwise_raw_scale_cap: float = 1.0
+    # Evaluation-only counterfactual applied after the side head has produced
+    # positive pose/depth amplitudes. It never changes the mean-state update.
+    layerwise_amplitude_intervention: Literal[
+        "true", "zero", "scale_half", "scale_double", "permute_within_owner"
+    ] = "true"
+    # New layerwise controls remain in the layerwise block; the pre-existing
+    # ``prope_impl`` field stays last for positional-config compatibility.
+    layerwise_legacy_compatibility: bool = False
+    # Detailed per-layer CPU digests are diagnostic-only and disabled for
+    # normal training to avoid repeated GPU-to-CPU synchronization.
+    layerwise_trace_enabled: bool = False
     # Timing configuration
     timing_enabled: bool = False
     # Select the vendored default or the locked official PRoPE harness.
@@ -231,7 +371,99 @@ class LVSMDecoderOnlyModelConfig:
 class LVSMDecoderOnlyModel(nn.Module):
     def __init__(self, config: LVSMDecoderOnlyModelConfig):
         super().__init__()
+        # Resolve layerwise defaults on a private copy.  Constructing a model
+        # must not mutate a caller-owned config (which may also configure a
+        # baseline model or be reused for a second arm).
+        self.requested_config = copy.deepcopy(config)
+        config = copy.deepcopy(config)
         self.config = config
+        self.layerwise_belief_refiner = None
+        self.last_layerwise_trace: list[dict[str, int | bool | str | float]] = []
+
+        layerwise_active = (
+            config.layerwise_belief_mode != "none"
+            or config.layerwise_belief_policy is not None
+        )
+        if (
+            not layerwise_active
+            and config.layerwise_amplitude_intervention != "true"
+        ):
+            raise ValueError(
+                "layer-wise amplitude intervention requires layer-wise refinement"
+            )
+        if layerwise_active:
+            if config.pos_enc != "flag_rope":
+                raise ValueError("layer-wise belief refinement requires flag_rope")
+            if config.rope_family is None:
+                raise ValueError("layer-wise belief refinement requires rope_family")
+            if config.use_recurrent_uncertainty:
+                raise ValueError("layer-wise refinement cannot be mixed with Mode D")
+            if config.encoder.checkpointing:
+                raise ValueError("layer-wise refinement currently requires checkpointing=False")
+            if config.uncertainty_strategy not in (None, "linearized_shared_sample"):
+                raise ValueError(
+                    "layer-wise refinement trains with linearized_shared_sample"
+                )
+            if config.layerwise_legacy_compatibility and (
+                config.layerwise_belief_policy is not None
+            ):
+                raise ValueError(
+                    "layerwise legacy compatibility requires an implicit policy"
+                )
+            expected_geometry = {
+                "ray": "ray_only",
+                "ray_point": "dual",
+                "segment_bounds": "segment",
+            }[config.rope_family]
+            # ``dual`` is the historical default for all families.  It is
+            # accepted as an implicit request, while an explicit incompatible
+            # family topology is rejected instead of silently rewritten.
+            if config.geometry_mode not in ("dual", expected_geometry):
+                raise ValueError(
+                    f"layerwise {config.rope_family} requires geometry_mode={expected_geometry}"
+                )
+            config.uncertainty_strategy = "linearized_shared_sample"
+            config.head_aware_frequency_layout = True
+            config.depth_width_calibrator = "raw_multiplier"
+            config.depth_width_scale = config.layerwise_depth_width_scale
+            config.geometry_mode = expected_geometry
+            if config.rope_family == "ray_point":
+                expected_ray_heads = config.encoder.layer.nhead // 2
+                expected_point_heads = (
+                    config.encoder.layer.nhead - expected_ray_heads
+                )
+                if config.num_ray_heads is not None and (
+                    config.num_ray_heads != expected_ray_heads
+                ):
+                    raise ValueError(
+                        "layerwise ray_point fixes num_ray_heads to half the attention heads"
+                    )
+                if config.num_point_heads is not None and (
+                    config.num_point_heads != expected_point_heads
+                ):
+                    raise ValueError(
+                        "layerwise ray_point fixes num_point_heads to the remaining heads"
+                    )
+                config.num_ray_heads = config.encoder.layer.nhead // 2
+                config.num_point_heads = (
+                    config.encoder.layer.nhead - config.num_ray_heads
+                )
+            elif config.rope_family == "segment_bounds":
+                config.segment_endpoint_bounds = True
+                if config.encoder.layer.nhead == 16:
+                    config.segment_head_allocation = (6, 6, 2, 2)
+                elif config.encoder.layer.nhead >= 4:
+                    remaining = config.encoder.layer.nhead - 2
+                    config.segment_head_allocation = (
+                        (remaining + 1) // 2,
+                        remaining // 2,
+                        1,
+                        1,
+                    )
+                else:
+                    raise ValueError(
+                        "segment_bounds requires at least four attention heads"
+                    )
         
         head_dim = config.encoder.layer.d_model // config.encoder.layer.nhead
 
@@ -426,8 +658,40 @@ class LVSMDecoderOnlyModel(nn.Module):
         if self.config.use_recurrent_uncertainty:
             self.config.encoder.layer.predict_d = 'none'
             self.config.encoder.layer.predict_delta = True
+        elif layerwise_active:
+            self.config.encoder.layer.predict_d = 'none'
+            self.config.encoder.layer.predict_delta = False
         
         self.encoder = self.config.encoder.setup()
+
+        if layerwise_active:
+            from tokenmap.models.scene.probabilistic_flag_rope.layerwise_belief import (
+                LayerwiseBeliefConfig,
+                LayerwiseBeliefRefiner,
+            )
+
+            self.layerwise_belief_refiner = LayerwiseBeliefRefiner(
+                    LayerwiseBeliefConfig(
+                    d_model=config.encoder.layer.d_model,
+                    num_layers=config.encoder.num_layers,
+                    num_patches=(config.img_shape[0] // config.patch_size)
+                    * (config.img_shape[1] // config.patch_size),
+                    mode=config.layerwise_belief_mode,
+                    policy=config.layerwise_belief_policy,
+                    update_parameterization=config.layerwise_update_parameterization,
+                    rope_family=config.rope_family,
+                    pose_scale_init=config.layerwise_pose_scale_init,
+                    depth_raw_width_init=config.init_sig,
+                    depth_width_scale=config.layerwise_depth_width_scale,
+                    rotation_cap=config.layerwise_rotation_cap,
+                    translation_cap=config.layerwise_translation_cap,
+                    log_depth_cap=config.layerwise_log_depth_cap,
+                    raw_scale_cap=config.layerwise_raw_scale_cap,
+                    amplitude_intervention=config.layerwise_amplitude_intervention,
+                    pose_intervention=config.layerwise_pose_intervention,
+                    legacy_compatibility=config.layerwise_legacy_compatibility,
+                )
+            )
 
         self.output_layer = nn.Linear(
             config.encoder.layer.d_model,
@@ -515,6 +779,7 @@ class LVSMDecoderOnlyModel(nn.Module):
             # tar_rays: [B, V2, H, W, C]
             ref_rays = self.create_rays(ref_cams)
             tar_rays = self.create_rays(tar_cams)
+            raw_ref_imgs = ref_imgs
 
             # print(f"before patchify:")
             # print(f"ref_imgs shape: {ref_imgs.shape}, ref_rays shape: {ref_rays.shape}, context_depths_patch shape: {context_depths.shape}")
@@ -527,7 +792,9 @@ class LVSMDecoderOnlyModel(nn.Module):
 
             # context_depths: [B, V1, N1, 1]
             if self.config.depth_input:
-                inverse_depths = 1.0 / context_depths
+                inverse_depths = _prepare_depth_input(
+                    context_depths, reference_images=raw_ref_imgs
+                )
                 context_depths_patch = patchify(inverse_depths, config.patch_size)
 
             # Tokenize into
@@ -590,7 +857,8 @@ class LVSMDecoderOnlyModel(nn.Module):
                             _pc_kwargs["sigma_overrides"] = pose_sigma_seed
                     elif pose_sigma_overrides is not None:
                         _pc_kwargs["sigma_overrides"] = pose_sigma_overrides
-                self.attention._precompute_and_cache_apply_fns(**_pc_kwargs)
+                if self.layerwise_belief_refiner is None:
+                    self.attention._precompute_and_cache_apply_fns(**_pc_kwargs)
 
         attention_call_index = 0
 
@@ -646,7 +914,62 @@ class LVSMDecoderOnlyModel(nn.Module):
         with time_block("transformer", enabled=timing_enabled):
             # run attentions
             xq = torch.cat([x, q], dim=1)
-            xq = self.encoder(xq, sdpa_fn=sdpa_fn)
+            layer_controller = None
+            if self.layerwise_belief_refiner is not None:
+                initial_depth, depth_available = _sample_layerwise_depth_tokens(
+                    context_depths,
+                    target_views=v2,
+                    patch_size=config.patch_size,
+                    reference_views=ref_cams.camtoworld.shape[1],
+                )
+                scene_scale = None
+                if config.scene_scale_value is not None:
+                    scene_scale = torch.full(
+                        (viewmats.shape[0],),
+                        float(config.scene_scale_value),
+                        device=viewmats.device,
+                        dtype=viewmats.dtype,
+                    )
+                from tokenmap.models.scene.probabilistic_flag_rope import (
+                    FlagRoPEAttentionSink,
+                    LayerwiseEdgeMask,
+                    LayerwiseRuntimeController,
+                )
+
+                configured_edges = tuple(config.layerwise_edge_mask)
+                expected_edges = config.encoder.num_layers - 1
+                if len(configured_edges) != expected_edges:
+                    # The historical config default is a five-edge tuple for
+                    # the six-layer encoder.  Preserve that input surface for
+                    # smaller CPU tests while validating the effective mask.
+                    if len(configured_edges) == 5:
+                        configured_edges = configured_edges[:expected_edges]
+                    else:
+                        raise ValueError(
+                            "layerwise_edge_mask must have num_layers - 1 entries"
+                        )
+                edge_mask = LayerwiseEdgeMask(
+                    edges=configured_edges,
+                    pose_mean=not config.layerwise_freeze_pose,
+                    amplitude=not config.layerwise_freeze_amplitude,
+                )
+                layer_controller = LayerwiseRuntimeController.from_inputs(
+                    refiner=self.layerwise_belief_refiner,
+                    sink=FlagRoPEAttentionSink(self.attention),
+                    w2cs=viewmats,
+                    intrinsics=Ks,
+                    depth=initial_depth,
+                    depth_available=depth_available,
+                    scene_scale=scene_scale,
+                    edge_mask=edge_mask,
+                    trace_enabled=config.layerwise_trace_enabled,
+                )
+            xq = self.encoder(
+                xq, sdpa_fn=sdpa_fn, layer_controller=layer_controller
+            )
+            self.last_layerwise_trace = (
+                list(layer_controller.trace) if layer_controller is not None else []
+            )
             q = xq[:, -q_tokens:, :]
             q = rearrange(q, "(b v) n d -> b v n d", b=batch_size, v=v2)
 

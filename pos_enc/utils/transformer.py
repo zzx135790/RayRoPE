@@ -8,7 +8,7 @@
 # mypy: allow-untyped-defs
 import copy
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Type
+from typing import Callable, Literal, Optional, Protocol, Type
 
 import torch
 import torch.nn.functional as F
@@ -35,6 +35,14 @@ def modulate(x, shift, scale):
 
 
 sdpa_fn_default = F.scaled_dot_product_attention
+
+
+class TransformerLayerController(Protocol):
+    """Explicit before/after-layer contract for stateful positional encodings."""
+
+    def before_layer(self, layer_index: int, tokens: Tensor) -> None: ...
+
+    def after_layer(self, layer_index: int, tokens: Tensor) -> None: ...
 
 
 @dataclass
@@ -166,13 +174,22 @@ class TransformerEncoder(Module):
         src: Tensor,
         sdpa_fn: Callable = sdpa_fn_default,
         cond: Optional[Tensor] = None,
+        layer_controller: Optional[TransformerLayerController] = None,
     ) -> Tensor:
         output = src
+
+        if layer_controller is not None and self.checkpointing:
+            raise ValueError(
+                "layer_controller is incompatible with checkpointing until "
+                "per-layer positional caches are replayable"
+            )
 
         if self.in_norm is not None:
             output = self.in_norm(output)
 
-        for mod in self.layers:
+        for layer_index, mod in enumerate(self.layers):
+            if layer_controller is not None:
+                layer_controller.before_layer(layer_index, output)
             if self.checkpointing:
                 output = torch.utils.checkpoint.checkpoint(
                     mod,
@@ -183,6 +200,8 @@ class TransformerEncoder(Module):
                 )
             else:
                 output = mod(output, sdpa_fn=sdpa_fn, cond=cond)
+            if layer_controller is not None:
+                layer_controller.after_layer(layer_index, output)
 
         if self.out_norm is not None:
             output = self.out_norm(output)
