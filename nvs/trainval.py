@@ -112,6 +112,42 @@ def _pose_noise_train_seed(noise_seed: int, step: int, acc_step: int) -> int:
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") & ((1 << 63) - 1)
 
 
+def _pose_level_is_noisy(rot_std: float, trans_std: float) -> bool:
+    """Return whether either pose component requests a non-clean input."""
+
+    return rot_std > 0.0 or trans_std > 0.0
+
+
+def _pose_noise_level_seed(
+    noise_seed: int, rot_std: float, trans_std: float, scene_index: int
+) -> int:
+    """Keep matched axis panels on the historical level-specific RNG stream."""
+
+    if noise_seed < 0 or scene_index < 0 or min(rot_std, trans_std) < 0.0:
+        raise ValueError("pose-noise seed inputs must be non-negative")
+    level = max(rot_std, trans_std)
+    return noise_seed + int(round(level * 1e6)) + scene_index
+
+
+def _exact_resume_data_alignment(*, data_cursor: int, batches_per_epoch: int) -> int:
+    """Reject continuation unless the next batch starts a fresh data epoch.
+
+    RE10K samples scenes and frames from the restored Python/NumPy RNG streams,
+    but the DataLoader itself has no serializable mid-epoch iterator.  An epoch
+    boundary is therefore the only position that can be reconstructed exactly.
+    """
+
+    if data_cursor < 0 or batches_per_epoch < 1:
+        raise ValueError("data cursor and batches per epoch must be valid")
+    offset = data_cursor % batches_per_epoch
+    if offset:
+        raise ValueError(
+            "exact continuation requires a DataLoader epoch boundary; "
+            f"cursor={data_cursor}, batches_per_epoch={batches_per_epoch}"
+        )
+    return offset
+
+
 def _effective_uncertainty_mc_samples(model_config: object, requested: int) -> int:
     """Avoid repeating a deterministic control while retaining requested provenance."""
 
@@ -250,6 +286,8 @@ class LVSMLauncherConfig(LauncherConfig):
 
     # Training config
     max_steps: int = 100_000  # override
+    scheduler_horizon_steps: Optional[int] = None
+    exact_resume_data: bool = False
     ckpt_every: int = 1000  # override
     print_every: int = 100
     visual_every: int = 100
@@ -299,6 +337,7 @@ class LVSMLauncherConfig(LauncherConfig):
     pose_noise_curriculum_steps: int = 0
     pose_noise_dirty_prob_final: float = 1.0
     pose_noise_test_levels: str = "0,0.01,0.02,0.05,0.1"  # rot level list (=trans level)
+    pose_noise_test_axes: str = "coupled"
     pose_noise_test_corrupt: int = 2  # test: fixed N of ref corrupted
     pose_noise_seed: int = 1234
     # X1 (σ-intervention): transform the σ told to a pose-aware model AT TEST time,
@@ -506,15 +545,37 @@ class LVSMLauncher(Launcher):
         return collected.mean().item(), len(collected)
 
     def _pose_test_levels(self) -> list:
-        """Parse pose_noise_test_levels → list of (rot_std, trans_std, tag)."""
+        """Parse the requested axes while preserving legacy coupled tags."""
         out = []
-        for s in self.config.pose_noise_test_levels.split(","):
-            s = s.strip()
-            if not s:
-                continue
-            v = float(s)
-            tag = "clean" if v == 0.0 else f"rot{v}"
-            out.append((v, v, tag))  # rot_std = trans_std = level
+        axes = tuple(
+            axis.strip() for axis in self.config.pose_noise_test_axes.split(",")
+            if axis.strip()
+        )
+        if not axes or any(
+            axis not in ("rotation_only", "translation_only", "coupled")
+            for axis in axes
+        ):
+            raise ValueError("pose_noise_test_axes contains an unsupported axis")
+        levels = [
+            float(value.strip())
+            for value in self.config.pose_noise_test_levels.split(",")
+            if value.strip()
+        ]
+        if 0.0 in levels:
+            out.append((0.0, 0.0, "clean", "clean"))
+        legacy_coupled_tags = axes == ("coupled",)
+        for axis in axes:
+            for value in levels:
+                if value == 0.0:
+                    continue
+                rot_std = value if axis in ("rotation_only", "coupled") else 0.0
+                trans_std = value if axis in ("translation_only", "coupled") else 0.0
+                tag = (
+                    f"rot{value:g}"
+                    if legacy_coupled_tags
+                    else f"{axis}-{value:g}"
+                )
+                out.append((rot_std, trans_std, tag, axis))
         return out
 
     @staticmethod
@@ -614,7 +675,11 @@ class LVSMLauncher(Launcher):
             raise ValueError(f"Unknown dataset: {self.config.dataset}")
             
         # print(f"train zoom_factor: {self.config.train_zoom_factor}, random_zoom: {self.config.train_random_zoom}")
-        num_workers = 2 if self.config.dataset in ["co3d", "re10k", "objaverse"] else 0
+        num_workers = (
+            0
+            if self.config.exact_resume_data
+            else (2 if self.config.dataset in ["co3d", "re10k", "objaverse"] else 0)
+        )
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=self.config.dataset_batch_scenes,
@@ -648,6 +713,9 @@ class LVSMLauncher(Launcher):
         )
 
         # ------------- Setup Scheduler. ------------- #
+        scheduler_horizon = self.config.scheduler_horizon_steps or self.config.max_steps
+        if scheduler_horizon <= self.config.warmup_steps:
+            raise ValueError("scheduler_horizon_steps must exceed warmup_steps")
         scheduler = torch.optim.lr_scheduler.ChainedScheduler(
             [
                 torch.optim.lr_scheduler.LinearLR(
@@ -657,7 +725,7 @@ class LVSMLauncher(Launcher):
                 ),
                 torch.optim.lr_scheduler.CosineAnnealingLR(
                     optimizer,
-                    T_max=self.config.max_steps - self.config.warmup_steps,
+                    T_max=scheduler_horizon - self.config.warmup_steps,
                 ),
             ]
         )
@@ -678,6 +746,7 @@ class LVSMLauncher(Launcher):
             "scheduler": scheduler,
             "dataloader": dataloader,
             "dataiter": iter(dataloader),
+            "data_cursor": 0,
             "ssim_fn": ssim_fn,
             "psnr_fn": psnr_fn,
             "lpips_fn": lpips_fn,
@@ -700,6 +769,7 @@ class LVSMLauncher(Launcher):
             dataiter = iter(dataloader)
             data = next(dataiter)
             state["dataiter"] = dataiter
+        state["data_cursor"] = int(state.get("data_cursor", 0)) + 1
 
         input_views = data["K"].shape[1] - self.config.dataset_supervise_views
         processed = self.preprocess(data, input_views=input_views)
@@ -941,6 +1011,18 @@ class LVSMLauncher(Launcher):
                     self.writer.add_scalar(f"train_timing/{key}_ms", value * 1000, step)
         return loss
 
+    def restore_data_state(self, state: Dict[str, Any]) -> None:
+        """Recreate the exact next RE10K iterator after RNG restoration."""
+
+        if not self.config.exact_resume_data:
+            return
+        dataloader = state["dataloader"]
+        _exact_resume_data_alignment(
+            data_cursor=int(state.get("data_cursor", 0)),
+            batches_per_epoch=len(dataloader),
+        )
+        state["dataiter"] = iter(dataloader)
+
     def test_initialize(
         self,
         model: Optional[torch.nn.Module] = None,
@@ -1157,7 +1239,7 @@ class LVSMLauncher(Launcher):
             self.config.pose_noise_test_sigma_transform,
         )
         levels = self._pose_test_levels()
-        for rot_std, trans_std, tag in levels:
+        for rot_std, trans_std, tag, noise_axis in levels:
             for label, (input_views, dataloader) in dataloaders.items():
                 psnrs, ssims, lpips = [], [], []
                 per_scene_records = []
@@ -1169,7 +1251,7 @@ class LVSMLauncher(Launcher):
                     tar_paths = processed.get("tar_paths")
                     context_depths = processed.get("context_depths", None)
                     pose_sigma_overrides = None
-                    if rot_std > 0.0:
+                    if _pose_level_is_noisy(rot_std, trans_std):
                         V1 = ref_cams.camtoworld.shape[1]
                         B = ref_cams.camtoworld.shape[0]
                         dtype = ref_cams.camtoworld.dtype
@@ -1179,8 +1261,13 @@ class LVSMLauncher(Launcher):
                         per_cam_rot[:, :n] = rot_std
                         per_cam_trans[:, :n] = trans_std
                         gen = torch.Generator(device=self.device).manual_seed(
-                            self.config.pose_noise_seed
-                            + int(round(rot_std * 1e6)) + idx)
+                            _pose_noise_level_seed(
+                                self.config.pose_noise_seed,
+                                rot_std,
+                                trans_std,
+                                idx,
+                            )
+                        )
                         ref_cams, pose_sigma_overrides = self._apply_pose_noise(
                             ref_cams, tar_cams, per_cam_rot, per_cam_trans, generator=gen)
                         if not _model_uses_pose_sigma(self.config.model_config):
@@ -1263,6 +1350,7 @@ class LVSMLauncher(Launcher):
                     "level_tag": tag,
                     "rot_std": rot_std,
                     "trans_std": trans_std,
+                    "noise_axis": noise_axis,
                     "step": step,
                     "n_total": n_total,
                     "psnr": avg_psnr,
@@ -1271,6 +1359,11 @@ class LVSMLauncher(Launcher):
                     "sigma_transform": pose_transform,
                     "depth_uncertainty_transform": depth_transform,
                     "uncertainty_intervention": self.config.uncertainty_intervention,
+                    "layerwise_amplitude_intervention": getattr(
+                        self.config.model_config,
+                        "layerwise_amplitude_intervention",
+                        "true",
+                    ),
                     "uncertainty_mc_samples": self.config.uncertainty_mc_samples,
                     "effective_uncertainty_mc_samples": effective_mc_samples,
                     "corruption_digest_kind": "post_noise_camtoworld_sha256_v1",

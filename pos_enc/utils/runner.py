@@ -75,6 +75,9 @@ class LauncherConfig:
     auto_resume: bool = False
     resume: str | None = None
     only_model: bool = False
+    # Exact continuation rejects legacy checkpoints that do not contain the
+    # optimizer-adjacent stochastic state required for trajectory equivalence.
+    require_exact_resume: bool = False
 
     # Save checkpoint every this many steps. (On only rank 0.)
     ckpt_every: int = 10
@@ -288,6 +291,11 @@ class Launcher:
             loss = F.mse_loss(output, data["y"])
         return loss
 
+    def restore_data_state(self, state: Any) -> None:
+        """Restore a subclass-owned training iterator after RNG state loading."""
+
+        return None
+
     # This function could be overriden to customize the behavior.
     @torch.inference_mode()
     def test_iteration(self, step: int, state: Any, acc_step: int = 0) -> Any:
@@ -357,6 +365,24 @@ class Launcher:
             state_dict["optimizer"] = state["optimizer"].state_dict()
             if state["scheduler"] is not None:
                 state_dict["scheduler"] = state["scheduler"].state_dict()
+            if "grad_scaler" in state:
+                state_dict["grad_scaler"] = state["grad_scaler"].state_dict()
+            numpy_state = np.random.get_state()
+            python_state = random.getstate()
+            state_dict["rng"] = {
+                "python_version": int(python_state[0]),
+                "python_state": torch.tensor(python_state[1], dtype=torch.int64),
+                "python_gauss": python_state[2],
+                "numpy_kind": str(numpy_state[0]),
+                "numpy_state": torch.from_numpy(numpy_state[1].copy()),
+                "numpy_position": int(numpy_state[2]),
+                "numpy_has_gauss": int(numpy_state[3]),
+                "numpy_cached_gauss": float(numpy_state[4]),
+                "torch_cpu": torch.get_rng_state(),
+                "torch_cuda": torch.cuda.get_rng_state_all(),
+            }
+            state_dict["data_cursor"] = int(state.get("data_cursor", 0))
+            state_dict["exact_resume_schema_version"] = 1
             torch.save(state_dict, f"{self.ckpt_dir}/step-{step:09d}.pt")
             fps = sorted(glob.glob(f"{self.ckpt_dir}/*.pt"))
             for fp in fps[: -self.config.ckpt_keeps]:
@@ -389,10 +415,41 @@ class Launcher:
 
             self.load_state_dict_to_model(ckpt["model"], state["model"])
             if not self.config.only_model and not self.config.test_only:
+                exact_fields = {
+                    "optimizer", "scheduler", "rng", "data_cursor",
+                    "exact_resume_schema_version",
+                }
+                if self.use_grad_scaler:
+                    exact_fields.add("grad_scaler")
+                missing = sorted(exact_fields - set(ckpt))
+                if self.config.require_exact_resume and missing:
+                    raise ValueError(
+                        f"exact continuation checkpoint is missing {missing}"
+                    )
                 self.load_state_dict_to_optimizer(ckpt["optimizer"], state["optimizer"])
                 self.load_state_dict_to_scheduler(
-                    ckpt["scheduler"], state.get("scheduler", None)
+                    ckpt.get("scheduler", {}), state.get("scheduler", None)
                 )
+                if "grad_scaler" in state and "grad_scaler" in ckpt:
+                    state["grad_scaler"].load_state_dict(ckpt["grad_scaler"])
+                if "rng" in ckpt:
+                    rng = ckpt["rng"]
+                    random.setstate((
+                        int(rng["python_version"]),
+                        tuple(int(value) for value in rng["python_state"].tolist()),
+                        rng["python_gauss"],
+                    ))
+                    np.random.set_state((
+                        str(rng["numpy_kind"]),
+                        rng["numpy_state"].numpy(),
+                        int(rng["numpy_position"]),
+                        int(rng["numpy_has_gauss"]),
+                        float(rng["numpy_cached_gauss"]),
+                    ))
+                    torch.set_rng_state(rng["torch_cpu"])
+                    torch.cuda.set_rng_state_all(rng["torch_cuda"])
+                state["data_cursor"] = int(ckpt.get("data_cursor", 0))
+                self.restore_data_state(state)
                 step_for_traindata = ckpt.get("step", 0)
                 step = ckpt.get("step", 0) + 1
             elif self.config.test_only:
@@ -437,12 +494,17 @@ class Launcher:
     def train(self):
         print("Distributed worker: %d / %d" % (self.world_rank + 1, self.world_size))
 
+        if self.config.require_exact_resume and self.world_size != 1:
+            raise ValueError("exact continuation currently requires world_size=1")
+
         if self.config.fixed_seed:
             set_random_seed(self.config.seed + self.world_rank)
         torch.cuda.set_device(self.local_rank)
 
         # Initialize model, dataset, optimizer, scheduler ... and load checkpoint if needed
         state = self.train_initialize()
+        if self.use_grad_scaler:
+            state["grad_scaler"] = torch.amp.GradScaler(device="cuda")
         init_step = self.maybe_resume(state)
         if self.config.test_every > 0:
             test_state = self.test_initialize(model=state["model"])
@@ -466,8 +528,7 @@ class Launcher:
                     v = DDP(v, device_ids=[self.local_rank])
                 state[k] = v
 
-        if self.use_grad_scaler:
-            grad_scaler = torch.amp.GradScaler(device="cuda")
+        grad_scaler = state.get("grad_scaler")
 
         # Training loop.
         self._start_training_runtime()
@@ -492,6 +553,7 @@ class Launcher:
 
                 # Backward.
                 if self.use_grad_scaler:
+                    assert grad_scaler is not None
                     grad_scaler.scale(loss).backward()
                 else:
                     loss.backward()
@@ -517,6 +579,7 @@ class Launcher:
             scheduler = state.get("scheduler", None)
 
             if self.use_grad_scaler:
+                assert grad_scaler is not None
                 grad_scaler.unscale_(optimizer)
                 if self.config.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(

@@ -10,12 +10,55 @@ from nvs.trainval import (
     LVSMLauncher,
     _camera_input_digest,
     _curriculum_noise_values,
+    _exact_resume_data_alignment,
     _effective_uncertainty_mc_samples,
     _model_uses_pose_sigma,
+    _pose_level_is_noisy,
+    _pose_noise_level_seed,
     _pose_noise_train_seed,
     _uncertainty_forward_seed,
     _uncertainty_intervention_modes,
 )
+
+
+def test_default_coupled_axis_preserves_historical_metric_tags():
+    launcher = object.__new__(LVSMLauncher)
+    launcher.config = SimpleNamespace(
+        pose_noise_test_axes="coupled",
+        pose_noise_test_levels="0,0.01,0.02",
+    )
+
+    assert launcher._pose_test_levels() == [
+        (0.0, 0.0, "clean", "clean"),
+        (0.01, 0.01, "rot0.01", "coupled"),
+        (0.02, 0.02, "rot0.02", "coupled"),
+    ]
+
+
+def test_explicit_multi_axis_panel_keeps_axes_separate_and_translation_is_noisy():
+    launcher = object.__new__(LVSMLauncher)
+    launcher.config = SimpleNamespace(
+        pose_noise_test_axes="rotation_only,translation_only,coupled",
+        pose_noise_test_levels="0,0.01",
+    )
+
+    assert launcher._pose_test_levels() == [
+        (0.0, 0.0, "clean", "clean"),
+        (0.01, 0.0, "rotation_only-0.01", "rotation_only"),
+        (0.0, 0.01, "translation_only-0.01", "translation_only"),
+        (0.01, 0.01, "coupled-0.01", "coupled"),
+    ]
+    assert _pose_level_is_noisy(0.0, 0.01)
+    assert not _pose_level_is_noisy(0.0, 0.0)
+    assert _pose_noise_level_seed(1234, 0.0, 0.01, 7) == (
+        _pose_noise_level_seed(1234, 0.01, 0.0, 7)
+    )
+
+
+def test_exact_resume_accepts_only_a_dataloader_epoch_boundary():
+    assert _exact_resume_data_alignment(data_cursor=10_000, batches_per_epoch=16) == 0
+    with pytest.raises(ValueError, match="epoch boundary"):
+        _exact_resume_data_alignment(data_cursor=9_999, batches_per_epoch=16)
 
 
 def test_blind_pose_noise_diagnostic_is_separate_from_noisy_training():
