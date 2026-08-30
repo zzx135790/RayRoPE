@@ -167,3 +167,13 @@ If you find our work useful, please consider citing us:
   year={2026}
 }
 ```
+# Contract integration
+
+The optional `pos_enc.integrations.rope_contract_provider` exposes the
+documented RayRoPE callable through the shared `rope-contract` middleware.
+`transform_inputs` prepares per-query-camera Q/K/V operands; the benchmark
+consumer owns `scaled_dot_product_attention`, then passes its message to
+`restore_output`. The native callable remains available from
+`RayRoPEProvider.legacy_native()` for an explicit rollback. The provider
+advertises the canonical 120+8 head layout and rejects unsupported cross
+attention instead of silently changing geometry.
