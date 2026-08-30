@@ -181,11 +181,21 @@ def _re10k_train_scenes(
 ) -> List[str]:
     """Resolve the exact RE10K training scene set, optionally from a manifest."""
 
-    available = {
-        path.name: str(path)
-        for path in Path(train_root).iterdir()
-        if path.is_dir() and (path / "transforms.json").is_file()
-    }
+    mode = os.environ.get("WORKSPACE_DATASET_MODE", "legacy")
+    if mode == "legacy":
+        available = {
+            path.name: str(path)
+            for path in Path(train_root).iterdir()
+            if path.is_dir() and (path / "transforms.json").is_file()
+        }
+    else:
+        from rope_contract.dataset.migration import DatasetRuntimeBinding
+
+        binding = DatasetRuntimeBinding.from_environment()
+        available = {
+            scene_id: scene_id
+            for scene_id in binding.create_provider().list_scene_ids(split="train")
+        }
     if manifest_path is None:
         return [available[name] for name in sorted(available)]
     manifest = Path(manifest_path)
@@ -205,6 +215,28 @@ def _re10k_train_scenes(
     if missing:
         raise ValueError(f"RE10K train scene manifest scenes are unavailable: {missing}")
     return [available[name] for name in names]
+
+
+def _re10k_dataset_types():
+    mode = os.environ.get("WORKSPACE_DATASET_MODE", "legacy")
+    if mode == "legacy":
+        return RE10K_TrainDataset, RE10K_EvalDataset
+    consumer = os.environ.get("WORKSPACE_DATASET_CONSUMER_ADAPTER")
+    if consumer == "rayrope-multiview-nvs-v1":
+        from nvs.re10k_contract import (
+            ContractRE10KEvalDataset,
+            ContractRE10KTrainDataset,
+        )
+
+        return ContractRE10KTrainDataset, ContractRE10KEvalDataset
+    if consumer == "flagrope-multiview-nvs-v1":
+        from tokenmap.data.re10k_contract import (
+            ContractRE10KEvalDataset,
+            ContractRE10KTrainDataset,
+        )
+
+        return ContractRE10KTrainDataset, ContractRE10KEvalDataset
+    raise ValueError(f"unsupported RE10K consumer adapter: {consumer!r}")
 
 
 def write_tensor_to_image(
@@ -631,7 +663,8 @@ class LVSMLauncher(Launcher):
             scenes = _re10k_train_scenes(
                 paths.train, self.config.re10k_train_scene_manifest
             )
-            dataset = RE10K_TrainDataset(
+            train_dataset_type, _ = _re10k_dataset_types()
+            dataset = train_dataset_type(
                 scenes,
                 patch_size=self.config.dataset_patch_size,
                 zoom_factor=self.config.train_zoom_factor,
@@ -1056,7 +1089,8 @@ class LVSMLauncher(Launcher):
                     "supported: (2,3) or (4,3).")
             
             for zoom_factor in self.config.test_zoom_factor:
-                dataset = RE10K_EvalDataset(
+                _, eval_dataset_type = _re10k_dataset_types()
+                dataset = eval_dataset_type(
                     folder=eval_root,
                     patch_size=self.config.dataset_patch_size,
                     zoom_factor=zoom_factor,
