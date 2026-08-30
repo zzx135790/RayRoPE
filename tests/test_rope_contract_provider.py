@@ -79,8 +79,8 @@ def test_consumer_message_restores_to_original_layout() -> None:
     assert torch.isfinite(restored.output).all()
 
 
-def test_zero_tail_matches_legacy_callable_attention() -> None:
-    """With the neutral tail disabled, provider and native 120-D paths agree."""
+def test_zero_tail_matches_legacy_geometry_with_canonical_scale() -> None:
+    """The 120-D native geometry agrees under the canonical 128-D SDPA scale."""
     provider = RayRoPEProvider(patches_x=2, patches_y=2, image_width=2, image_height=2)
     geometry = _geometry()
     q, k, v = _qkv()
@@ -90,7 +90,17 @@ def test_zero_tail_matches_legacy_callable_attention() -> None:
     predicted = torch.zeros(1, 8, 2)
     native = provider.legacy_native()
     native._precompute_and_cache_apply_fns(geometry.w2cs, geometry.intrinsics)
-    expected = native(q[..., :120], k[..., :120], v[..., :120], predicted_d=predicted)
+    wrapped = getattr(native._prepare_apply_fns, "__wrapped__", None)
+    q_fn, kv_fns, out_fn = wrapped(native, predicted_d=predicted) if wrapped else native._prepare_apply_fns(predicted_d=predicted)
+    expected_message = torch.zeros_like(q[..., :120])
+    q_encoded = q_fn(q[..., :120])
+    for camera, kv_fn in enumerate(kv_fns):
+        start, end = camera * 4, (camera + 1) * 4
+        expected_message[:, :, start:end] = torch.nn.functional.scaled_dot_product_attention(
+            q_encoded[:, :, start:end], kv_fn(k[..., :120]), kv_fn(v[..., :120]),
+            scale=128 ** -0.5,
+        )
+    expected = out_fn(expected_message)
     session = provider.open_session_for_geometry(geometry)
     prepared = session.transform_inputs(
         make_transform_request(q, k, v, profile_id="rayrope_v1", predicted_d=predicted)
