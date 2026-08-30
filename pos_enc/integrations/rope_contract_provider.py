@@ -36,6 +36,7 @@ try:
         TransformRequest,
         TransformResult,
         UnsupportedCapability,
+        InvalidContinuation,
         ValidationError,
     )
 except ImportError as exc:  # pragma: no cover - depends on workspace env
@@ -281,6 +282,11 @@ class RayRoPESession(RopeSession):
         self._pending: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any, int, int]] = {}
         self._native: Optional[RayRoPE_DotProductAttention] = None
 
+    def close(self) -> None:
+        self._pending.clear()
+        self._native = None
+        super().close()
+
     def _transform_inputs_impl(self, request: TransformRequest) -> TransformResult:
         if request.attention_kind not in {"self", "multi_camera_dense_self"}:
             raise UnsupportedCapability("RayRoPE baseline provider supports self attention only", actual=request.attention_kind)
@@ -361,7 +367,7 @@ class RayRoPESession(RopeSession):
         try:
             q, k, v, out_fn, batch, cameras = self._pending[continuation.token]
         except KeyError as exc:
-            raise ValidationError("unknown or already restored RayRoPE continuation") from exc
+            raise InvalidContinuation("unknown or already restored RayRoPE continuation") from exc
         message = _tensor(attention_message, "attention_message")
         expected = q.shape
         if tuple(message.shape) != tuple(expected) or message.device != q.device or message.dtype != q.dtype:
