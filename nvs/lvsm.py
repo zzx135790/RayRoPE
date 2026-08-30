@@ -379,6 +379,13 @@ class LVSMDecoderOnlyModel(nn.Module):
         self.config = config
         self.layerwise_belief_refiner = None
         self.last_layerwise_trace: list[dict[str, int | bool | str | float]] = []
+        # The public rope-contract provider is selected lazily at the runtime
+        # boundary below.  Keeping this optional preserves the baseline's
+        # importability when the local middleware checkout is not installed;
+        # managed workspace runs inject it explicitly and therefore exercise
+        # the contract path.
+        self.rope_provider = None
+        self.last_rope_contract: dict[str, object] | None = None
 
         layerwise_active = (
             config.layerwise_belief_mode != "none"
@@ -693,6 +700,25 @@ class LVSMDecoderOnlyModel(nn.Module):
                 )
             )
 
+        if config.pos_enc == "flag_rope":
+            try:
+                from tokenmap.integrations.rope_contract import FlagRoPEProvider
+            except (ImportError, ModuleNotFoundError):
+                # A plain RayRoPE checkout remains usable without the optional
+                # middleware dependency.  The workspace-managed canonical
+                # launcher injects rope-contract and records the provider
+                # metadata in its result receipt.
+                self.rope_provider = None
+            else:
+                if (
+                    self.layerwise_belief_refiner is None
+                    or self.layerwise_belief_refiner.config.num_layers == 6
+                ):
+                    self.rope_provider = FlagRoPEProvider(
+                        attention=self.attention,
+                        layerwise_refiner=self.layerwise_belief_refiner,
+                    )
+
         self.output_layer = nn.Linear(
             config.encoder.layer.d_model,
             config.img_shape[-1] * config.patch_size**2,
@@ -818,15 +844,79 @@ class LVSMDecoderOnlyModel(nn.Module):
             Ks = torch.cat([ref_Ks, tar_Ks], dim=1)  # [B, N, 3, 3] per camera
             viewmats = torch.inverse(c2ws)
 
+        # Build one isolated provider session for this forward.  The provider
+        # owns geometry/frequency/uncertainty transforms and, for the complete
+        # layerwise profile, its own recurrence state.  The transformer host
+        # remains responsible for the actual SDPA kernel and output projection.
+        rope_session = None
+        layerwise_initial_depth = None
+        layerwise_depth_available = None
+        depths_for_rope = (
+            repeat(context_depths, "b v1 h w 1 -> (b v2) v1 h w 1", v2=v2)
+            if context_depths is not None
+            else None
+        )
+        # Sample the layerwise depth tokens independently of whether the
+        # optional middleware is installed.  Unmanaged/small test models use
+        # the legacy controller and must receive the same observed-depth and
+        # availability tensors as the contract-backed six-layer path.
+        if self.layerwise_belief_refiner is not None:
+            layerwise_initial_depth, layerwise_depth_available = (
+                _sample_layerwise_depth_tokens(
+                    context_depths,
+                    target_views=v2,
+                    patch_size=config.patch_size,
+                    reference_views=ref_cams.camtoworld.shape[1],
+                )
+            )
+        if config.pos_enc == "flag_rope" and self.rope_provider is not None:
+            from tokenmap.integrations.rope_contract import FlagRoPEGeometry
+
+            if self.layerwise_belief_refiner is not None:
+                if layerwise_initial_depth is not None:
+                    # Missing target/invalid reference patches are explicit
+                    # zero-length tokens.  This lets the provider reconstruct
+                    # the same availability mask without a private controller
+                    # or a tensor-bearing metadata escape hatch.
+                    assert layerwise_depth_available is not None
+                    layerwise_initial_depth = torch.where(
+                        layerwise_depth_available,
+                        layerwise_initial_depth,
+                        torch.zeros_like(layerwise_initial_depth),
+                    )
+                geometry_depths = layerwise_initial_depth
+                depth_source = "observed"
+                profile_id = "layerwise_complete_module_v1"
+            else:
+                geometry_depths = None
+                depth_source = (
+                    "predicted" if config.depth_type != "none" else "missing"
+                )
+                profile_id = None
+            geometry = FlagRoPEGeometry(
+                w2cs=viewmats,
+                intrinsics=Ks,
+                depths=geometry_depths,
+                scene_scale_depths=depths_for_rope,
+                depth_source=depth_source,
+                batch_id=f"lvsm-{id(self)}",
+                metadata={
+                    "token_count": int(viewmats.shape[1]) * self.attention.num_patches,
+                    "consumer": "rayrope-lvsm",
+                },
+            )
+            rope_session = self.rope_provider.open_session_for_geometry(
+                geometry,
+                profile_id=profile_id,
+                consumer_id="rayrope-lvsm",
+                consumer_version="1",
+            )
+
         with time_block("precompute_enc", enabled=timing_enabled):
             if  "0_pj" in config.pos_enc or "0_3d" in config.pos_enc \
                 or config.pos_enc in ["global-0+inf", "global-0+d"] \
                 or config.pos_enc == "flag_rope":
 
-                if context_depths is not None:
-                    depths_for_rope = repeat(context_depths, "b v1 h w 1 -> (b v2) v1 h w 1", v2=v2)
-                else:
-                    depths_for_rope = None
                 _pc_kwargs = dict(w2cs=viewmats, Ks=Ks, context_depths=depths_for_rope)
                 # flag_rope uncertainty σ routing:
                 #   mode C (use_pose_uncertainty): pose_sigma_overrides = the TRUE
@@ -857,7 +947,7 @@ class LVSMDecoderOnlyModel(nn.Module):
                             _pc_kwargs["sigma_overrides"] = pose_sigma_seed
                     elif pose_sigma_overrides is not None:
                         _pc_kwargs["sigma_overrides"] = pose_sigma_overrides
-                if self.layerwise_belief_refiner is None:
+                if self.layerwise_belief_refiner is None and rope_session is None:
                     self.attention._precompute_and_cache_apply_fns(**_pc_kwargs)
 
         attention_call_index = 0
@@ -896,6 +986,57 @@ class LVSMDecoderOnlyModel(nn.Module):
                     )
                     sdpa_kwargs["generator"] = generator
                 attention_call_index += 1
+            if config.pos_enc == "flag_rope" and rope_session is not None:
+                # Consumer-owned attention boundary: the FlagRoPE provider
+                # prepares transformed/expanded QKV, this host executes SDPA,
+                # and the provider restores the logical [B,H,N,D] message.
+                # No benchmark kernel is reachable from the provider itself.
+                dropout_p = float(sdpa_kwargs.pop("dropout_p", 0.0))
+                predicted_d = sdpa_kwargs.pop("predicted_d", None)
+                predicted_d_kv = sdpa_kwargs.pop("predicted_d_kv", None)
+                uncertainty = sdpa_kwargs.pop("uncertainty", None)
+                generator = sdpa_kwargs.pop("generator", None)
+                seed = sdpa_kwargs.pop("seed", None)
+                depth_observability = sdpa_kwargs.pop("depth_observability", None)
+                if sdpa_kwargs:
+                    raise ValueError(
+                        "unsupported SDPA arguments at the rope-contract boundary: "
+                        f"{sorted(sdpa_kwargs)}"
+                    )
+                metadata = {}
+                if depth_observability is not None:
+                    metadata["native_kwargs"] = {
+                        "depth_observability": depth_observability
+                    }
+                prepared = rope_session.attend(
+                    q,
+                    k,
+                    v,
+                    profile_id=rope_session.profile.profile_id,
+                    predicted_d=predicted_d,
+                    predicted_d_kv=predicted_d_kv,
+                    uncertainty=uncertainty,
+                    generator=generator,
+                    seed=seed,
+                    dropout_p=dropout_p,
+                    training=self.training,
+                    metadata=metadata,
+                )
+                message = F.scaled_dot_product_attention(
+                    prepared.query,
+                    prepared.key,
+                    prepared.value,
+                    dropout_p=dropout_p,
+                )
+                restored = rope_session.restore_output(
+                    message,
+                    continuation=prepared.continuation,
+                )
+                if restored.output is None:
+                    raise RuntimeError(
+                        "rope-contract provider returned no restored attention output"
+                    )
+                return restored.output
             if config.pos_enc == "gta":
                 # GTA is effectively PRoPE without intrinsics.
                 return self.attention(q, k, v, viewmats=viewmats, Ks=None, timing_enabled=timing_enabled, **sdpa_kwargs)
@@ -915,13 +1056,14 @@ class LVSMDecoderOnlyModel(nn.Module):
             # run attentions
             xq = torch.cat([x, q], dim=1)
             layer_controller = None
-            if self.layerwise_belief_refiner is not None:
-                initial_depth, depth_available = _sample_layerwise_depth_tokens(
-                    context_depths,
-                    target_views=v2,
-                    patch_size=config.patch_size,
-                    reference_views=ref_cams.camtoworld.shape[1],
-                )
+            if rope_session is not None and self.layerwise_belief_refiner is not None:
+                # FlagRoPESession implements the generic transformer lifecycle
+                # and keeps recurrence state isolated to this forward.
+                layer_controller = rope_session
+            elif self.layerwise_belief_refiner is not None:
+                # Legacy fallback for an unmanaged checkout without the local
+                # middleware.  Managed canonical runs always take the branch
+                # above and therefore cannot silently bypass the contract.
                 scene_scale = None
                 if config.scene_scale_value is not None:
                     scene_scale = torch.full(
@@ -958,18 +1100,40 @@ class LVSMDecoderOnlyModel(nn.Module):
                     sink=FlagRoPEAttentionSink(self.attention),
                     w2cs=viewmats,
                     intrinsics=Ks,
-                    depth=initial_depth,
-                    depth_available=depth_available,
+                    depth=layerwise_initial_depth,
+                    depth_available=layerwise_depth_available,
                     scene_scale=scene_scale,
                     edge_mask=edge_mask,
                     trace_enabled=config.layerwise_trace_enabled,
                 )
-            xq = self.encoder(
-                xq, sdpa_fn=sdpa_fn, layer_controller=layer_controller
-            )
-            self.last_layerwise_trace = (
-                list(layer_controller.trace) if layer_controller is not None else []
-            )
+            try:
+                xq = self.encoder(
+                    xq, sdpa_fn=sdpa_fn, layer_controller=layer_controller
+                )
+            finally:
+                if rope_session is not None:
+                    self.last_layerwise_trace = list(rope_session.layerwise_trace)
+                    self.last_rope_contract = {
+                        "provider_id": rope_session.manifest.provider_id,
+                        "provider_version": rope_session.manifest.provider_version,
+                        "provider_adapter_id": rope_session.manifest.adapter_id,
+                        "provider_adapter_version": rope_session.manifest.adapter_version,
+                        "capability_digest": rope_session.manifest.digest,
+                        "profile_id": rope_session.profile.profile_id,
+                        "profile_digest": rope_session.profile.digest,
+                        "consumer_id": "rayrope-lvsm",
+                        "consumer_adapter_id": "rayrope-contract-consumer",
+                        "consumer_adapter_version": "1",
+                        "execution_mode": "provider_prepare_consumer_sdpa_provider_restore",
+                        "trace_rows": len(rope_session.layerwise_trace),
+                    }
+                    rope_session.close()
+                else:
+                    self.last_layerwise_trace = (
+                        list(layer_controller.trace)
+                        if layer_controller is not None
+                        else []
+                    )
             q = xq[:, -q_tokens:, :]
             q = rearrange(q, "(b v) n d -> b v n d", b=batch_size, v=v2)
 
