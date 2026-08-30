@@ -167,6 +167,7 @@ If you find our work useful, please consider citing us:
   year={2026}
 }
 ```
+
 # Contract integration
 
 The optional `pos_enc.integrations.rope_contract_provider` exposes the
