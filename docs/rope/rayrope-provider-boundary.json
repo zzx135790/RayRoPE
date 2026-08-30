@@ -1,0 +1,39 @@
+{
+  "schema_version": "1",
+  "contract_version": {"major": 1, "minor": 0, "patch": 0},
+  "contract_digest": "4977153b296b6a2c22d907071372e378c8d6c784bc5caee97659551625fd2f39",
+  "provider_id": "rayrope",
+  "provider_version": "1",
+  "provider_adapter_id": "rayrope-contract-provider",
+  "provider_adapter_version": "1",
+  "provider_source_commit": "28b86e2",
+  "consumer_id": "rope-contract-provider-boundary",
+  "consumer_version": "1",
+  "consumer_adapter_id": "rope-contract-provider-boundary",
+  "consumer_adapter_version": "1",
+  "source_commits": {"rayrope": "28b86e2", "rope-contract": "bd21025"},
+  "feature_id": "rayrope_v1",
+  "profile_id": "rayrope_v1",
+  "capability_digest": "rayrope-v1",
+  "fixture_digest": "b9ce1f3b2042612ff27b945c8d19271d2ad1023c2fea167f1e209d504fcef255",
+  "tensor_layout_summary": {
+    "owner": "rayrope",
+    "attention_kernel": "consumer",
+    "token_order": "camera_major_token_major",
+    "native_tail_channels": 8
+  },
+  "validation_outcome": {
+    "status": "verified",
+    "scope": "provider-transform-restore",
+    "attention_kernel_owner": "consumer",
+    "legacy_selector": "legacy_native",
+    "contract_selector": "contract"
+  },
+  "status": "verified",
+  "metadata": {
+    "source": "rayrope-four-rope-closeout",
+    "rollback_selector": "legacy_native",
+    "scope": "provider-boundary; benchmark consumer promotion remains separate"
+  },
+  "digest": "01b654f057ea1a97eae81a47dfb7d39078c140a4a5b8d58a02c63a69a1533c15"
+}
