@@ -263,7 +263,7 @@ def _profile(*, head_dim: int, apply_vo: bool, config: Mapping[str, Any]) -> Pro
             "attention_kernel_owner": "consumer",
             "native_callable": "RayRoPE_DotProductAttention",
             "value_policy": "native_apply_vo" if apply_vo else "pass_through",
-            "tail_policy": "none",
+            "tail_policy": "first_120_transformed_plus_8_neutral",
             "geometry_convention": "world_to_camera+pixel_intrinsics",
             "token_order": TOKEN_ORDER,
             "config": dict(config),
@@ -309,11 +309,19 @@ class RayRoPESession(RopeSession):
         # the canonical 128-channel head.  The final eight channels are a
         # neutral, exact identity tail retained by this adapter.
         transformed_dim = 120 if head_dim == 128 else head_dim
+        if self.provider.depth_type == "known+predict_dsig" and self.geometry.context_depths is None:
+            raise ValidationError(
+                "known+predict_dsig requires context_depths [B,C,H,W,1]"
+            )
+        if self.provider.depth_type == "predict_dsig" and self.geometry.context_depths is not None:
+            raise ValidationError(
+                "predict_dsig does not accept context_depths; select known+predict_dsig explicitly"
+            )
         native = RayRoPE_DotProductAttention(
             head_dim=transformed_dim, patches_x=patches_x, patches_y=patches_y,
             image_width=int(self.provider.image_width), image_height=int(self.provider.image_height),
             pos_enc_type=self.provider.pos_enc_type, num_rays_per_patch=self.provider.num_rays_per_patch,
-            depth_type=("known+predict_dsig" if self.geometry.context_depths is not None else "predict_dsig"),
+            depth_type=self.provider.depth_type,
             denc_type=self.provider.denc_type, freq_base=self.provider.freq_base,
             apply_vo=self.provider.apply_vo,
         ).to(device=q.device)
