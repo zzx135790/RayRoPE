@@ -120,6 +120,8 @@ class RayRoPEGeometry:
             )
         if w2cs.shape[:2] != intrinsics.shape[:2]:
             raise ShapeMismatch("w2cs and intrinsics must share [B,C]")
+        if w2cs.shape[0] <= 0 or w2cs.shape[1] <= 0:
+            raise ShapeMismatch("w2cs must contain at least one batch and camera")
         if w2cs.device != intrinsics.device or w2cs.dtype != intrinsics.dtype:
             raise ValidationError("w2cs and intrinsics must share dtype and device")
         object.__setattr__(self, "w2cs", w2cs)
@@ -374,7 +376,15 @@ class RayRoPESession(RopeSession):
             raise ShapeMismatch("attention message must match transformed query", expected=tuple(expected), actual=tuple(message.shape))
         logical_message = message.reshape(batch, cameras, message.shape[1], message.shape[2], message.shape[3]).permute(0, 2, 1, 3, 4).reshape(batch, message.shape[1], cameras * message.shape[2], message.shape[3])
         transformed_dim = 120 if logical_message.shape[-1] == 128 else logical_message.shape[-1]
-        restored = torch.cat((out_fn(logical_message[..., :transformed_dim]), logical_message[..., transformed_dim:]), dim=-1)
+        if self.provider.apply_vo:
+            restored = torch.cat(
+                (out_fn(logical_message[..., :transformed_dim]), logical_message[..., transformed_dim:]),
+                dim=-1,
+            )
+        else:
+            # ``apply_vo=False`` is the native Q/K-only mode: values and the
+            # attention message remain in the consumer's original basis.
+            restored = logical_message
         del self._pending[continuation.token]
         return TransformResult(output=restored, tensor_descriptors={"output": _descriptor(restored, role="output")},
                                metadata={"execution_mode": "restored_output", "output_shape": list(restored.shape)})
@@ -390,6 +400,8 @@ class RayRoPEProvider(RopeProvider):
                  provider_id: str = PROVIDER_ID) -> None:
         if head_dim <= 0:
             raise ShapeMismatch("head_dim must be positive", actual=head_dim)
+        if patches_x <= 0 or patches_y <= 0 or image_width <= 0 or image_height <= 0:
+            raise ShapeMismatch("patch grid and image dimensions must be positive")
         if depth_type not in {"predict_dsig", "known+predict_dsig"}:
             raise UnsupportedCapability("unsupported RayRoPE depth_type", actual=depth_type)
         self.patches_x, self.patches_y = int(patches_x), int(patches_y)
